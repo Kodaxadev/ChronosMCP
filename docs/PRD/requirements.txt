@@ -1,0 +1,6 @@
+# CHRONOS v2.3 dependencies
+# Pinned to compatible-release ranges (~=) for reproducibility.
+# Run `pip install -r requirements.txt` to install.
+
+mcp[cli]~=1.6
+numpy~=2.2

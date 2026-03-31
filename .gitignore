@@ -1,0 +1,44 @@
+# Python Caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest / Coverage
+.pytest_cache/
+pytest-cache-files-*/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# Development Docs & Spec Files
+docs/
+*.docx
+CHRONOS_v*.md
+CHRONOS_v*.docx
+adversarial_audit_report.md
+
+# Virtual Environments
+venv/
+env/
+.env
+.venv
+ENV/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.cursor/
+.cursorrules
+
+# MacOS
+.DS_Store
