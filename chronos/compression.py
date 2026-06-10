@@ -33,12 +33,12 @@ TRIM_TOKENS = 150
 RESPONSE_BUDGET_DEFAULT = 4000
 # Per-result: above this, replace with extract + metadata stub
 SUMMARIZE_TOKENS = 300
-# Approximate words per token (inverse of TFIDFIndex.TOKENS_PER_WORD)
+# Approximate words per token (inverse of search.TOKENS_PER_WORD)
 WORDS_PER_TOKEN = 1.33  # 1/0.75
 
 
 def _estimate_tokens(text: str) -> int:
-    """Quick token estimate matching TFIDFIndex.estimate_tokens()."""
+    """Quick token estimate matching search.estimate_tokens()."""
     return max(1, round(len(text.split()) * 0.75))
 
 
@@ -191,9 +191,14 @@ def compress_results(
             for r in compressed
         )
 
-    # Tier 3: If STILL over budget, summarize remaining
+    # Tier 3: If STILL over budget, summarize remaining. The threshold is
+    # derived from the budget (per-result allowance), not the fixed
+    # SUMMARIZE_TOKENS — otherwise a single mid-sized result could never be
+    # compressed below a small budget (caught by the v4.0 test suite).
+    # Floor of 50: stubs are ~50 tokens, so a tighter threshold is unreachable.
     if budget is not None and total > effective_budget:
-        compressed = tier3_summarize(compressed)
+        per_result = max(50, (effective_budget - overhead) // max(1, len(compressed)))
+        compressed = tier3_summarize(compressed, threshold=per_result)
         applied.append("summarize")
         total = overhead + sum(
             r.get("token_estimate", _estimate_tokens(r.get("content", "")))

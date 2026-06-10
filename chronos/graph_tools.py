@@ -29,6 +29,24 @@ def _author_bucket(s: str) -> int:
     return int(hashlib.sha256(s.encode()).hexdigest(), 16) % 10
 
 
+def _node_features(payload: dict) -> list:
+    """
+    Map node payload to a [0,1]-scaled feature vector using FIXED scales.
+
+    NORMALIZATION FIX (v4.0): v3.x min-max scaled each vector by its own
+    min/max inside embed(), which mapped any two proportional payloads
+    (e.g. priority=1/complexity=5 and priority=2/complexity=10) to the
+    IDENTICAL embedding. Fixed per-feature scales preserve cross-node
+    comparability. Values outside the expected range are clamped.
+    """
+    return [
+        max(0.0, min(payload.get("priority", 0), 10)) / 10.0,
+        min(len(payload.get("tags", [])), 10) / 10.0,
+        _author_bucket(payload.get("author", "")) / 9.0,
+        max(0.0, min(payload.get("complexity", 5), 10)) / 10.0,
+    ]
+
+
 def register_graph_tools(mcp: FastMCP, embedder) -> None:
     """
     Register graph-layer MCP tools on the given FastMCP instance.
@@ -62,6 +80,14 @@ def register_graph_tools(mcp: FastMCP, embedder) -> None:
         validate_event(aggregate_id, event_type, payload)
         event_id = uuid7()
 
+        # DEADLOCK FIX (v4.0): maybe_resize() opens its own connection and
+        # commits. It MUST run before we open the write transaction below —
+        # SQLite allows one writer at a time, so a resize attempted while
+        # this handler holds the write lock fails with 'database is locked'
+        # (reproduced in the v3.3 audit at the 257-node resize threshold).
+        if event_type in ("node_created", "node_updated"):
+            embedder.maybe_resize()
+
         with get_db() as db:
             db.execute(
                 "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)",
@@ -70,14 +96,7 @@ def register_graph_tools(mcp: FastMCP, embedder) -> None:
             )
 
             if event_type in ("node_created", "node_updated"):
-                embedder.maybe_resize()
-                features = [
-                    payload.get("priority", 0),
-                    len(payload.get("tags", [])),
-                    _author_bucket(payload.get("author", "")),
-                    payload.get("complexity", 5),
-                ]
-                vec = embedder.embed(aggregate_id, features)
+                vec = embedder.embed(aggregate_id, _node_features(payload))
                 db.execute(
                     "INSERT OR REPLACE INTO embeddings VALUES (?, ?, ?, ?)",
                     (aggregate_id, vec.tobytes(), 1, embedder.dim),
@@ -124,7 +143,7 @@ def register_graph_tools(mcp: FastMCP, embedder) -> None:
         Similarity is based on node payload features (priority, tag count,
         author, complexity) embedded in Poincaré ball space — NOT content
         semantics. For keyword/content similarity, use recall(). For
-        content-vector similarity, use query_similar_memories().
+        memories that share vocabulary, use related_memories().
 
         node_id: aggregate_id of the reference node (must exist in graph).
         k:       number of neighbors to return (default 5, max 50).

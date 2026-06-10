@@ -142,20 +142,15 @@ class HyperbolicEmbedder:
         """
         Embed node into the Poincaré ball.
 
-        Feature scaling: all raw features are min-max scaled to [0, 1] before
-        padding/truncation so no single feature dominates by magnitude.
-        The hash-based identity feature is scaled alongside the others — it
-        acts as a stable tiebreaker rather than the primary distance signal.
-        Magnitude hierarchy is still preserved by project_to_ball().
+        Features must arrive already scaled to [0, 1] using FIXED per-feature
+        scales (see graph_tools._node_features). v3.x min-max scaled each
+        vector by its own min/max here, which made any two proportional
+        feature vectors embed identically — destroying exactly the
+        cross-node comparability the index exists to provide (audit fix).
+        Values are clipped to [0, 1] defensively.
         """
         vec = np.array(features, dtype=np.float32)
-
-        # Min-max scale to [0, 1] so features contribute equally
-        v_min, v_max = vec.min(), vec.max()
-        if v_max - v_min > 1e-8:
-            vec = (vec - v_min) / (v_max - v_min)
-        else:
-            vec = np.zeros_like(vec)  # all features identical — no signal
+        vec = np.clip(vec, 0.0, 1.0)
 
         if len(vec) > self.dim:
             vec = vec[:self.dim]

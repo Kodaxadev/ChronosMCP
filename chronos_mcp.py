@@ -2,34 +2,36 @@
 # Responsibility: Initialize schema, build singletons, register tools, run server.
 # No domain logic lives here. See chronos/ package for all implementation.
 #
-# Architecture: CHRONOS v3.2 — zero-dependency Claude project memory layer
-# Primary interface: remember / recall / forget / query_at /
-#                    update_memory / query_similar_memories
-# Cognitive interface: set_confidence / boost_confidence / weaken_confidence /
-#                      review_memory / get_memory_health / log_search_feedback /
-#                      search_effectiveness / consolidate_memories
-# Advanced interface: add_event / query_similar / analyze_causal /
-#                     suggest_next_tasks / analyze_structure / add_constraint
+# Architecture: CHRONOS v4.0 — temporal memory layer for Claude
+#   Core interface:      remember / recall / get_memory / forget /
+#                        restore_memory / purge_memory / update_memory /
+#                        related_memories / query_at
+#   Cognitive interface: set_confidence / boost_confidence / weaken_confidence /
+#                        review_memory / get_memory_health / log_search_feedback /
+#                        search_effectiveness / consolidate_memories
+#   Graph interface:     add_event / query_similar / add_constraint /
+#                        analyze_causal / suggest_next_tasks / analyze_structure
+#                        — OPT-IN via CHRONOS_ENABLE_GRAPH=1. Quarantined in
+#                        v4.0: structural-feature similarity proved a weak
+#                        signal in practice, and the layer is experimental.
 #
-# Module layout:
-#   tools.py               — memory tools + register() wiring point
-#   graph_tools.py         — add_event, query_similar, add_constraint
-#   analysis_tools.py      — analyze_causal, suggest_next_tasks, analyze_structure
-#   memory_tools.py        — update_memory, query_similar_memories
-#   belief_tools.py        — confidence scoring + FSRS review tools
-#   consolidation_tools.py — dream consolidation tool
+# Search is SQLite FTS5/BM25, trigger-synced with content writes — there is
+# no in-memory index and no startup rebuild (see chronos/db.py, search.py).
+
+import os
 
 from mcp.server.fastmcp import FastMCP
 
-from chronos.analyzers import CausalAnalyzer, ConstraintSolver, StructureAnalyzer
 from chronos.beliefs import BeliefEngine
 from chronos.consolidation import ConsolidationEngine
 from chronos.db import init_db
-from chronos.geometry import HyperbolicEmbedder
-from chronos.mem_embed import MemoryEmbedder
 from chronos.memory import MemoryStore
-from chronos.tfidf import TFIDFIndex
 from chronos.tools import register
+
+
+def _graph_enabled() -> bool:
+    return os.environ.get("CHRONOS_ENABLE_GRAPH", "").lower() in ("1", "true", "yes")
+
 
 # ---------------------------------------------------------------------------
 # Server instance
@@ -41,32 +43,36 @@ mcp = FastMCP("chronos")
 # Startup: schema → singletons → tool registration
 # ---------------------------------------------------------------------------
 
-# 1. Apply DDL + column migrations once — not on every connection
+# 1. Apply DDL + migrations + FTS index/triggers once — not per connection
 init_db()
 
-# 2. Build singletons after DB is confirmed ready
-embedder  = HyperbolicEmbedder(dim=32)
-embedder.load_from_db()   # restore node embeddings persisted from previous sessions
-
-causal    = CausalAnalyzer()
-solver    = ConstraintSolver()
-structure = StructureAnalyzer()
-
-# 3. Memory layer: TF-IDF index + content embedding index
-tfidf        = TFIDFIndex()
-mem_embedder = MemoryEmbedder(dim=32)
-mem_store    = MemoryStore(tfidf, mem_embedder=mem_embedder)
-mem_store.load()  # rebuilds TF-IDF index AND loads memory_vectors from DB
-
-# 4. Cognitive subsystem: belief engine + dream consolidation
+# 2. Core singletons (stateless — all persistence lives in SQLite)
+mem_store            = MemoryStore()
 belief_engine        = BeliefEngine()
-consolidation_engine = ConsolidationEngine(belief_engine, tfidf)
+consolidation_engine = ConsolidationEngine(belief_engine)
 
-# 5. Register all tools — single call wires all sub-modules
+# 3. Optional graph layer — experimental, off by default
+embedder = None
+if _graph_enabled():
+    from chronos.analyzers import CausalAnalyzer, ConstraintSolver, StructureAnalyzer
+    from chronos.analysis_tools import register_analysis_tools
+    from chronos.geometry import HyperbolicEmbedder
+    from chronos.graph_tools import register_graph_tools
+
+    embedder = HyperbolicEmbedder(dim=32)
+    embedder.load_from_db()
+    register_graph_tools(mcp, embedder)
+    register_analysis_tools(
+        mcp, CausalAnalyzer(), ConstraintSolver(), StructureAnalyzer()
+    )
+
+# 4. Register core tools — single call wires all always-on sub-modules
 register(
-    mcp, embedder, causal, solver, structure, mem_store, mem_embedder,
+    mcp,
+    mem_store,
     belief_engine=belief_engine,
     consolidation_engine=consolidation_engine,
+    embedder=embedder,
 )
 
 # ---------------------------------------------------------------------------

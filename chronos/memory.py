@@ -1,34 +1,41 @@
 # chronos/memory.py
-# Responsibility: High-level memory operations — remember, recall, forget, query_at.
-# This is the primary interface between MCP tools and the storage/indexing layer.
+# Responsibility: High-level memory operations — remember, recall, get, update.
+# Lifecycle transitions (forget/restore/purge) live in lifecycle.py;
+# time-travel lives in time_travel.py. This is the primary interface
+# between MCP tools and the storage layer.
 #
-# Architecture:
-#   - memories table  → persistent text storage (db.py)
-#   - TFIDFIndex      → in-memory content retrieval (tfidf.py)
-#   - HyperbolicEmbedder → structural/relational similarity (geometry.py)
+# Architecture (v4.0):
+#   - memories table   → persistent text storage (db.py)
+#   - memories_fts     → BM25 full-text index, trigger-synced (db.py, search.py)
+#
+# The v3.x in-memory TF-IDF index and structural memory vectors are gone:
+# the index now lives in the same SQLite file and commits atomically with
+# content writes. MemoryStore holds no state of its own.
 #
 # Token budget design:
-#   Every recall response includes a `token_estimate` field so Claude can
-#   decide how many results to request without blindly inflating context.
+#   recall() reports a token_estimate per result. Compression is applied
+#   ONLY when the caller passes token_budget — results are never silently
+#   truncated (v3.3 trimmed anything over 150 tokens unconditionally, and
+#   offered no way to fetch full content; both fixed in v4.0).
 
 import json
-import math
 from datetime import datetime
 from typing import List, Optional
 
+from chronos import lifecycle
 from chronos.beliefs import BeliefEngine, CONFIDENCE_DEFAULT, STABILITY_DEFAULT
 from chronos.compression import compress_results
 from chronos.db import get_db
+from chronos.search import estimate_tokens, search_memories
 from chronos.time_travel import query_at as _time_travel_query_at
-from chronos.tfidf import TFIDFIndex
 from chronos.uuid7 import uuid7
 
 # Approximate tokens consumed by the recall response wrapper itself
 _RECALL_OVERHEAD_TOKENS = 40
 
-# Recency decay: score multiplier = 1 + recency_weight * (1 / (1 + days_old))
-# Default 0.3 gives ~23% boost for same-day memories, ~15% boost for 3-day-old,
-# ~10% boost for 7-day-old.  Set to 0.0 to disable.
+# Recency decay: score multiplier = 1 + recency_weight * boost.
+# Default 0.3 gives a mild boost to fresh/confident memories without
+# inverting rankings on high-scoring older ones. Set to 0.0 to disable.
 _DEFAULT_RECENCY_WEIGHT = 0.3
 
 
@@ -52,17 +59,13 @@ def _fsrs_boost(stability: float, last_reviewed: str, created_at: str,
     """
     FSRS-aware ranking boost. Combines retention probability with confidence.
 
-    Returns a value in [0, 1] that replaces the old recency_factor.
-    Higher when the memory is both confident AND well-retained.
+    Returns a value in [0, 1]. Higher when the memory is both confident AND
+    well-retained:
+      boost = retention * confidence_factor
+      retention = (1 + days/(9*S))^(-1)        [FSRS forgetting curve]
+      confidence_factor = 0.5 + 0.5*confidence [0.01→0.505, 0.99→0.995]
 
-    Formula: boost = retention * confidence_factor
-      where retention = (1 + days/(9*S))^(-1)  [FSRS forgetting curve]
-      and confidence_factor = 0.5 + 0.5 * confidence  [scales 0.01→0.505, 0.99→0.995]
-
-    This means:
-      - A high-confidence, recently-reviewed memory gets maximum boost
-      - A low-confidence, stale memory gets almost no boost
-      - Confidence alone doesn't override staleness (and vice versa)
+    Confidence alone doesn't override staleness, and vice versa.
     """
     review_ts = last_reviewed or created_at
     days = BeliefEngine.days_since(review_ts)
@@ -77,37 +80,10 @@ def _fsrs_boost(stability: float, last_reviewed: str, created_at: str,
 
 class MemoryStore:
     """
-    Full lifecycle of free-text memories: remember, recall, forget, update, query_at.
-
-    mem_embedder: optional MemoryEmbedder. When provided, remember() and update()
-    also store content vectors enabling query_similar_memories(). Pass None for
-    TF-IDF-only mode (e.g. lightweight tests).
+    Full lifecycle of free-text memories. Stateless — all persistence and
+    indexing live in SQLite (see db.py). Constructed once at startup and
+    injected into tool handlers via closure.
     """
-
-    def __init__(self, tfidf: TFIDFIndex, mem_embedder=None) -> None:
-        self.tfidf       = tfidf
-        self.mem_embedder = mem_embedder  # MemoryEmbedder | None
-
-    # ------------------------------------------------------------------
-    # Startup
-    # ------------------------------------------------------------------
-
-    def load(self) -> int:
-        """
-        Load all non-forgotten memories from DB into the TF-IDF index.
-        If a MemoryEmbedder is attached, also loads memory vectors from DB.
-        Call once at server startup after init_db().
-        Returns number of memories loaded.
-        """
-        with get_db() as db:
-            rows = db.execute(
-                "SELECT id, content FROM memories WHERE forgotten = 0"
-            ).fetchall()
-        docs = [(r[0], r[1]) for r in rows]
-        self.tfidf.load_documents(docs)
-        if self.mem_embedder is not None:
-            self.mem_embedder.load_from_db()
-        return len(docs)
 
     # ------------------------------------------------------------------
     # remember
@@ -118,11 +94,17 @@ class MemoryStore:
         content: str,
         project: str = "default",
         tags: Optional[List[str]] = None,
+        source: str = "user",
     ) -> dict:
         """
-        Store a free-text memory and index it for retrieval.
+        Store a free-text memory. The FTS trigger indexes it in the same
+        transaction as the insert.
 
-        Returns: {id, project, token_estimate, indexed_terms}
+        source: provenance label — where this memory's content came from
+        (e.g. 'user', 'claude', 'web', 'document'). Recall results echo it
+        so the consumer can weigh trust accordingly.
+
+        Returns: {id, project, source, token_estimate}
         """
         if not content or not content.strip():
             raise ValueError("content must be a non-empty string")
@@ -134,25 +116,19 @@ class MemoryStore:
         with get_db() as db:
             db.execute(
                 """INSERT INTO memories
-                   (id, project, content, tags, created_at, updated_at, forgotten)
-                   VALUES (?, ?, ?, ?, ?, ?, 0)""",
-                (mem_id, project, content.strip(), json.dumps(tags), now, now),
+                   (id, project, content, tags, created_at, updated_at,
+                    forgotten, source)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, ?)""",
+                (mem_id, project, content.strip(), json.dumps(tags),
+                 now, now, source),
             )
             db.commit()
-
-        self.tfidf.add_document(mem_id, content)
-
-        embedded = False
-        if self.mem_embedder is not None:
-            self.mem_embedder.embed_and_store(mem_id, content, tags, project, now)
-            embedded = True
 
         return {
             "id":             mem_id,
             "project":        project,
-            "token_estimate": self.tfidf.estimate_tokens(content),
-            "indexed_terms":  self.tfidf.doc_count(),
-            "embedded":       embedded,
+            "source":         source,
+            "token_estimate": estimate_tokens(content),
         }
 
     # ------------------------------------------------------------------
@@ -170,84 +146,44 @@ class MemoryStore:
         """
         Retrieve the k most relevant memories for a query.
 
-        Ranking: TF-IDF cosine similarity over stored content, with optional
-        recency decay multiplier. Final score = tfidf_score * (1 + recency_weight
-        * recency_factor) where recency_factor = 1/(1+days_old).
+        Ranking: BM25 over the FTS5 index (porter-stemmed), then re-ranked
+        with an FSRS retention*confidence boost when recency_weight > 0.
+        Scores are relative ranking values, not normalised [0,1].
 
-        recency_weight=0.0 disables decay (pure TF-IDF ranking).
-        recency_weight=0.3 (default) gives a mild boost to recent memories
-        without inverting rankings on high-scoring older ones.
+        Compression runs ONLY when token_budget is set. Without a budget,
+        content is returned in full.
 
         Returns:
           {
-            results: [{id, project, content, score, token_estimate}],
+            results: [{id, project, content, score, token_estimate,
+                       source, confidence?}],
             total_tokens: int,
             count: int,
             query: str,
+            compression_applied: [..]   (only when token_budget was set)
           }
         """
         if not query or not query.strip():
             return {"results": [], "total_tokens": 0, "count": 0, "query": query}
 
-        # Get forgotten IDs to exclude
-        with get_db() as db:
-            forgotten = {
-                r[0] for r in db.execute(
-                    "SELECT id FROM memories WHERE forgotten = 1"
-                ).fetchall()
-            }
-            # Fetch all candidate metadata in one shot.
-            # v3.2: also fetch FSRS columns for retention-aware ranking.
-            if project:
-                rows = db.execute(
-                    """SELECT id, project, content, created_at,
-                              confidence, stability, last_reviewed
-                       FROM memories
-                       WHERE project = ? AND forgotten = 0""",
-                    (project,),
-                ).fetchall()
-            else:
-                rows = db.execute(
-                    """SELECT id, project, content, created_at,
-                              confidence, stability, last_reviewed
-                       FROM memories WHERE forgotten = 0"""
-                ).fetchall()
-
-        meta = {r[0]: {
-            "project": r[1], "content": r[2], "created_at": r[3],
-            "confidence": r[4], "stability": r[5], "last_reviewed": r[6],
-        } for r in rows}
-
-        # Restrict TF-IDF search to this project's IDs if filtered.
-        # exclude = all forgotten IDs plus all IDs NOT in this project's metadata.
-        # The meta dict already contains only the target project's docs (fetched
-        # with WHERE project = ?), so the difference gives us all non-project docs.
-        exclude = forgotten
-        if project:
-            exclude = exclude | (self.tfidf.doc_ids() - set(meta.keys()))
-
-        # Pull more candidates than k if decay is on (re-rank may change top-k)
+        # Over-fetch when re-ranking may reorder the top-k
         fetch_k = k * 3 if recency_weight > 0 else k
-        ranked  = self.tfidf.query(query, k=fetch_k, exclude=exclude)
+        with get_db() as db:
+            rows = search_memories(db, query, project=project, k=fetch_k)
 
-        # Apply FSRS-aware boost and re-rank.
-        # v3.2: uses retention * confidence instead of simple 1/(1+days) recency.
-        # Falls back to legacy recency_factor if FSRS columns are NULL (pre-v3.2 data).
         boosted = []
-        for doc_id, score in ranked:
-            if doc_id not in meta:
-                continue
+        for r in rows:
+            score = r["score"]
             if recency_weight > 0:
-                m = meta[doc_id]
-                if m.get("stability") is not None:
+                if r["stability"] is not None:
                     boost = _fsrs_boost(
-                        m["stability"], m["last_reviewed"],
-                        m["created_at"], m["confidence"],
+                        r["stability"], r["last_reviewed"],
+                        r["created_at"], r["confidence"],
                     )
                 else:
-                    boost = _recency_factor(m["created_at"])
+                    boost = _recency_factor(r["created_at"])
                 score = score * (1.0 + recency_weight * boost)
-            boosted.append((doc_id, score))
+            boosted.append((r, score))
 
         boosted.sort(key=lambda x: x[1], reverse=True)
         boosted = boosted[:k]
@@ -255,39 +191,34 @@ class MemoryStore:
         results      = []
         total_tokens = _RECALL_OVERHEAD_TOKENS
 
-        for doc_id, score in boosted:
-            m = meta[doc_id]
-            content  = m["content"]
-            tok_est  = self.tfidf.estimate_tokens(content)
+        for r, score in boosted:
+            tok_est = estimate_tokens(r["content"])
             total_tokens += tok_est
             entry = {
-                "id":             doc_id,
-                "project":        m["project"],
-                "content":        content,
+                "id":             r["id"],
+                "project":        r["project"],
+                "content":        r["content"],
                 "score":          round(score, 5),
                 "token_estimate": tok_est,
+                "source":         r["source"] or "user",
             }
-            # v3.2: include confidence in results when available
-            if m.get("confidence") is not None:
-                entry["confidence"] = round(m["confidence"], 4)
+            if r["confidence"] is not None:
+                entry["confidence"] = round(r["confidence"], 4)
             results.append(entry)
 
-        # v3.3: Apply token-budget compression when requested.
-        # Tier 1 (trim) always runs; Tier 2/3 only when budget is set.
-        if token_budget is not None or any(
-            r.get("token_estimate", 0) > 150 for r in results
-        ):
+        # v4.0: compression is opt-in. No budget → full content, always.
+        if token_budget is not None:
             compressed = compress_results(
                 results,
                 budget=token_budget,
                 overhead=_RECALL_OVERHEAD_TOKENS,
             )
             return {
-                "results":              compressed["results"],
-                "total_tokens":         compressed["total_tokens"],
-                "count":                len(compressed["results"]),
-                "query":                query,
-                "compression_applied":  compressed["compression_applied"],
+                "results":             compressed["results"],
+                "total_tokens":        compressed["total_tokens"],
+                "count":               len(compressed["results"]),
+                "query":               query,
+                "compression_applied": compressed["compression_applied"],
             }
 
         return {
@@ -298,37 +229,48 @@ class MemoryStore:
         }
 
     # ------------------------------------------------------------------
-    # forget
+    # get — full single-memory retrieval (no truncation, ever)
     # ------------------------------------------------------------------
 
-    def forget(self, memory_id: str, reason: str = "manual") -> dict:
+    def get(self, memory_id: str) -> dict:
         """
-        Soft-delete a memory. Sets forgotten=1 in DB and removes from
-        the TF-IDF index. The record is retained for audit and query_at().
+        Fetch one memory by id with full content and metadata.
+        Works on forgotten memories too (the forgotten field says so).
 
-        Returns: {id, status, reason}
+        Returns: {id, project, content, tags, source, created_at, updated_at,
+                  confidence, forgotten, forget_reason, version_count,
+                  token_estimate}
+        or {id, status: 'not_found'}.
         """
         with get_db() as db:
             row = db.execute(
-                "SELECT id, forgotten FROM memories WHERE id = ?", (memory_id,)
+                """SELECT id, project, content, tags, source, created_at,
+                          updated_at, confidence, forgotten, forget_reason
+                   FROM memories WHERE id = ?""",
+                (memory_id,),
             ).fetchone()
-
             if not row:
-                return {"id": memory_id, "status": "not_found", "reason": reason}
-            if row[1] == 1:
-                return {"id": memory_id, "status": "already_forgotten", "reason": reason}
+                return {"id": memory_id, "status": "not_found"}
+            version_count = db.execute(
+                "SELECT COUNT(*) FROM memory_versions WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()[0]
 
-            db.execute(
-                """UPDATE memories SET forgotten = 1,
-                   updated_at = ? WHERE id = ?""",
-                (datetime.now().isoformat(), memory_id),
-            )
-            db.commit()
-
-        self.tfidf.remove_document(memory_id)
-        if self.mem_embedder is not None:
-            self.mem_embedder.remove(memory_id)
-        return {"id": memory_id, "status": "forgotten", "reason": reason}
+        return {
+            "id":             row["id"],
+            "project":        row["project"],
+            "content":        row["content"],
+            "tags":           json.loads(row["tags"] or "[]"),
+            "source":         row["source"] or "user",
+            "created_at":     row["created_at"],
+            "updated_at":     row["updated_at"],
+            "confidence":     round(row["confidence"], 4)
+                              if row["confidence"] is not None else None,
+            "forgotten":      bool(row["forgotten"]),
+            "forget_reason":  row["forget_reason"],
+            "version_count":  version_count,
+            "token_estimate": estimate_tokens(row["content"]),
+        }
 
     # ------------------------------------------------------------------
     # update
@@ -336,65 +278,69 @@ class MemoryStore:
 
     def update(self, memory_id: str, content: str) -> dict:
         """
-        Replace the content of an existing memory and re-index it.
+        Replace the content of an existing memory. The old content is
+        snapshotted into memory_versions (time-travel), and the FTS trigger
+        re-indexes the new content in the same transaction.
         Raises ValueError if the memory does not exist or is forgotten.
 
-        Returns: {id, token_estimate}
+        Returns: {id, status, token_estimate}
         """
         if not content or not content.strip():
             raise ValueError("content must be a non-empty string")
 
         with get_db() as db:
             row = db.execute(
-                "SELECT forgotten, project, tags, created_at, content, updated_at"
+                "SELECT forgotten, content, updated_at"
                 " FROM memories WHERE id = ?",
                 (memory_id,)
             ).fetchone()
             if not row:
                 raise ValueError(f"Memory '{memory_id}' not found")
-            if row[0] == 1:
-                raise ValueError(f"Memory '{memory_id}' is forgotten — restore first")
+            if row["forgotten"] == 1:
+                raise ValueError(
+                    f"Memory '{memory_id}' is forgotten — call restore_memory"
+                    " first, or remember() the corrected content as a new entry"
+                )
 
-            project     = row[1]
-            tags        = json.loads(row[2] or "[]")
-            created_at  = row[3]
-            old_content = row[4]
-            old_updated = row[5]
+            old_content = row["content"]
+            old_updated = row["updated_at"]
             now         = datetime.now().isoformat()
 
-            # FIX #4: Snapshot old content into memory_versions before overwriting.
-            # valid_from = when this version became current (last updated_at or created_at)
-            # valid_to   = now (when it's being replaced)
-            version_id = uuid7()
+            # Snapshot old content into memory_versions before overwriting.
+            # valid_from = when this version became current; valid_to = now.
             db.execute(
                 """INSERT INTO memory_versions
                    (id, memory_id, content, valid_from, valid_to)
                    VALUES (?, ?, ?, ?, ?)""",
-                (version_id, memory_id, old_content, old_updated, now),
+                (uuid7(), memory_id, old_content, old_updated, now),
             )
-
             db.execute(
                 "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
                 (content.strip(), now, memory_id),
             )
             db.commit()
 
-        self.tfidf.add_document(memory_id, content)  # add_document replaces existing
-
-        if self.mem_embedder is not None:
-            self.mem_embedder.embed_and_store(
-                memory_id, content, tags, project, created_at
-            )
-
         return {
             "id":             memory_id,
             "status":         "updated",
-            "token_estimate": self.tfidf.estimate_tokens(content),
+            "token_estimate": estimate_tokens(content),
         }
 
     # ------------------------------------------------------------------
-    # query_at — time-travel (delegated to time_travel.py)
+    # Delegated operations — lifecycle.py and time_travel.py own the logic
     # ------------------------------------------------------------------
+
+    def forget(self, memory_id: str, reason: str = "manual") -> dict:
+        """Soft-delete. See lifecycle.forget()."""
+        return lifecycle.forget(memory_id, reason)
+
+    def restore(self, memory_id: str) -> dict:
+        """Un-forget. See lifecycle.restore()."""
+        return lifecycle.restore(memory_id)
+
+    def purge(self, memory_id: str) -> dict:
+        """Hard-delete, irreversible. See lifecycle.purge()."""
+        return lifecycle.purge(memory_id)
 
     def query_at(
         self,
@@ -403,13 +349,5 @@ class MemoryStore:
         project: Optional[str] = None,
         k: int = 5,
     ) -> dict:
-        """
-        Reconstruct which memories existed at `timestamp` and rank them
-        against `query` using a fresh TF-IDF index over that snapshot.
-
-        Delegates to chronos.time_travel.query_at() — extracted to keep
-        this file under the 500-line hard limit.
-
-        Returns same shape as recall() plus `as_of` field.
-        """
-        return _time_travel_query_at(TFIDFIndex, query, timestamp, project, k)
+        """Time-travel recall. See time_travel.query_at()."""
+        return _time_travel_query_at(query, timestamp, project, k)

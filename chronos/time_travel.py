@@ -1,17 +1,16 @@
 # chronos/time_travel.py
 # Responsibility: Time-travel queries — reconstruct memory state at a past timestamp.
 #
-# Extracted from memory.py (which was approaching the 500-line limit) per the
-# architecture doc recommendation. This module owns query_at() and all the
-# version-resolution logic needed to show content as it existed at any point.
-#
-# Dependencies: TFIDFIndex (for building temporary snapshot indexes), get_db.
+# This module owns query_at() and the version-resolution logic needed to
+# show content as it existed at any point. Snapshot ranking uses the same
+# BM25 + porter pipeline as live recall (search.rank_snapshot), so scores
+# are comparable across the two tools.
 
 from datetime import datetime
 from typing import List, Optional
 
 from chronos.db import get_db
-from chronos.tfidf import TFIDFIndex
+from chronos.search import estimate_tokens, rank_snapshot
 
 # Approximate tokens consumed by the recall response wrapper
 _RECALL_OVERHEAD_TOKENS = 40
@@ -21,7 +20,6 @@ _BATCH = 900
 
 
 def query_at(
-    tfidf_class: type,
     query: str,
     timestamp: str,
     project: Optional[str] = None,
@@ -29,12 +27,12 @@ def query_at(
 ) -> dict:
     """
     Reconstruct which memories existed at `timestamp` and rank them
-    against `query` using a fresh TF-IDF index over that snapshot.
+    against `query` using an ephemeral BM25 index over that snapshot.
 
-    tfidf_class: TFIDFIndex class (passed to avoid import-time coupling).
     timestamp: ISO 8601 string, e.g. '2026-03-01T00:00:00'
     Memories created after `timestamp` are excluded.
-    Memories forgotten before `timestamp` are excluded.
+    Memories forgotten at or before `timestamp` are excluded.
+    Content edited since is resolved back through memory_versions.
 
     Returns same shape as recall() plus `as_of` field.
     """
@@ -106,10 +104,8 @@ def query_at(
             "count": 0, "query": query, "as_of": timestamp,
         }
 
-    # Build a temporary TF-IDF index over the snapshot
-    snap_index = tfidf_class()
-    snap_index.load_documents([(s[0], s[1]) for s in snapshot])
-    ranked = snap_index.query(query, k=k)
+    # Rank the snapshot with an ephemeral BM25 index
+    ranked = rank_snapshot([(s[0], s[1]) for s in snapshot], query, k=k)
 
     meta         = {s[0]: {"content": s[1], "project": s[2]} for s in snapshot}
     results      = []
@@ -117,7 +113,7 @@ def query_at(
 
     for doc_id, score in ranked:
         content  = meta[doc_id]["content"]
-        tok_est  = snap_index.estimate_tokens(content)
+        tok_est  = estimate_tokens(content)
         total_tokens += tok_est
         results.append({
             "id":             doc_id,

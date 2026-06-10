@@ -1,103 +1,105 @@
 # chronos/memory_tools.py
 # Responsibility: Overflow MCP tool registrations for advanced memory operations.
+# Owns: update_memory, related_memories.
 #
-# Separated from tools.py because tools.py reached the 400-line module limit.
-# This module owns: update_memory, query_similar_memories.
+# Separated from tools.py to keep modules under the 400-line limit.
+# Registration: called once from tools.register() after singletons exist.
 #
-# Registration: called once from chronos_mcp.py via register_memory_tools()
-# after all singletons are initialised.
-#
-# Design note: tools are registered via closure over injected singletons —
-# no module-level globals, no circular imports, no fragile lazy imports.
+# v4.0: related_memories replaces the v3.x query_similar_memories tool.
+# The old tool compared structural features (length, tag count, project
+# hash) in hyperbolic space — which surfaced same-length memories, not
+# related ones. related_memories uses the memory's own content as a BM25
+# query, which finds memories that share distinctive vocabulary.
 
 from mcp.server.fastmcp import FastMCP
 
+from chronos.db import get_db
+from chronos.search import search_memories
 
-def register_memory_tools(fastmcp: FastMCP, ms, me) -> None:
+
+def register_memory_tools(fastmcp: FastMCP, mem_store) -> None:
     """
     Register extended memory MCP tools on the given FastMCP instance.
-    Called once from chronos_mcp.py after init_db() and all loads complete.
-
-    fastmcp: the shared FastMCP server instance (same object as in tools.py)
-    ms:      MemoryStore instance
-    me:      MemoryEmbedder instance (or None if running without vector index)
-    """
-    _register(fastmcp, ms, me)
-
-
-def _register(mcp: FastMCP, mem_store, mem_embedder) -> None:
-    """
-    Close over injected singletons. This avoids all module-level state and
-    eliminates the circular-import trap from the previous implementation.
+    mem_store: MemoryStore singleton.
     """
 
-    @mcp.tool()
+    @fastmcp.tool()
     async def update_memory(memory_id: str, content: str) -> dict:
         """
         Replace the content of an existing memory and re-index it.
         Use this to correct, expand, or clarify a previously stored memory
-        without losing its original creation timestamp or breaking time-travel.
+        without losing its original creation timestamp or breaking time-travel
+        (the prior content is snapshotted automatically).
 
         memory_id: the id returned by remember() or recall().
         content:   new free-text content to replace the existing entry.
 
         Returns: {id, status, token_estimate}
-        status is 'updated' on success, 'error' if memory not found or forgotten.
-        Forgotten memories cannot be updated (call remember() with corrected
-        content instead — this preserves audit integrity).
+        status is 'updated' on success, 'error' if not found or forgotten
+        (restore_memory first, or remember() the correction as a new entry).
         """
         try:
             return mem_store.update(memory_id, content)
         except ValueError as exc:
             return {"id": memory_id, "status": "error", "detail": str(exc)}
 
-    @mcp.tool()
-    async def query_similar_memories(
+    @fastmcp.tool()
+    async def related_memories(
         memory_id: str,
         k: int = 5,
         project: str = None,
     ) -> dict:
         """
-        Find memories that are structurally similar to a given memory using
-        hyperbolic distance in the content embedding space.
+        Find memories related to a given memory — 'more like this'.
 
-        This bridges the remember/recall (TF-IDF) and add_event/query_similar
-        (hyperbolic) pipelines. Use it to find related memories when you know
-        one memory and want to discover others with similar content structure
-        and project affinity.
+        Uses the memory's own content as a relevance query (BM25 over
+        distinctive terms), so results share vocabulary and topic with the
+        source memory. Use recall() when you have a question; use this when
+        you have a memory and want its neighbours.
 
         memory_id: id of a stored memory (from remember() or recall()).
-        k:         number of similar memories to return (default 5, max 20).
+        k:         number of related memories (default 5, max 20).
         project:   optional — restrict results to this project only.
 
-        Returns: {results: [{memory_id, distance, content_preview}], count, source_id}
-
-        Note: similarity is structural (content length, tag count, project,
-        recency) — NOT semantic. Use recall() with a descriptive query for
-        semantic/keyword similarity.
+        Returns: {results: [{memory_id, project, score, content_preview}],
+                  count, source_id}
         """
-        if mem_embedder is None:
-            return {
-                "results":   [],
-                "count":     0,
-                "source_id": memory_id,
-                "error": "Vector index not available — server started without MemoryEmbedder",
-            }
+        k = max(1, min(k, 20))
 
-        k       = max(1, min(k, 20))
-        results = mem_embedder.nearest(memory_id, k=k, project=project)
+        with get_db() as db:
+            row = db.execute(
+                "SELECT content, forgotten FROM memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+            if not row:
+                return {
+                    "results": [], "count": 0, "source_id": memory_id,
+                    "error": f"Memory '{memory_id}' not found",
+                }
+            if row["forgotten"]:
+                return {
+                    "results": [], "count": 0, "source_id": memory_id,
+                    "error": f"Memory '{memory_id}' is forgotten — restore it first",
+                }
 
-        enriched = []
-        for r in results:
-            preview = mem_store.tfidf.get_text(r["memory_id"])
-            enriched.append({
-                "memory_id":       r["memory_id"],
-                "distance":        r["distance"],
-                "content_preview": (preview[:120] + "…") if len(preview) > 120 else preview,
+            rows = search_memories(
+                db, row["content"], project=project, k=k, exclude_id=memory_id
+            )
+
+        results = []
+        for r in rows:
+            preview = r["content"]
+            if len(preview) > 120:
+                preview = preview[:120] + "…"
+            results.append({
+                "memory_id":       r["id"],
+                "project":         r["project"],
+                "score":           round(r["score"], 4),
+                "content_preview": preview,
             })
 
         return {
-            "results":   enriched,
-            "count":     len(enriched),
+            "results":   results,
+            "count":     len(results),
             "source_id": memory_id,
         }
