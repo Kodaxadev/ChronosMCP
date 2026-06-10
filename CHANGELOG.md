@@ -4,6 +4,37 @@ All notable changes to ChronosMCP are documented here. Entries are ordered newes
 
 ---
 
+## v4.1.0 — 2026-06-10
+
+### Hybrid semantic search (opt-in)
+
+`CHRONOS_SEMANTIC=1` + `pip install "chronosmcp[semantic]"` upgrades recall
+from lexical BM25 to **hybrid retrieval**: BM25 candidates and local-embedding
+nearest neighbors (fastembed / ONNX bge-small-en-v1.5, ~70MB downloaded once,
+no API keys, no torch) merged with Reciprocal Rank Fusion. "car" now finds a
+memory about an *automobile* with zero lexical overlap. Off by default —
+flag-off behavior is byte-identical to v4.0 and asserted by test.
+
+Design notes:
+- Hybrid retrieval, not re-rank-only: re-ranking can't fix the synonym
+  problem when BM25 returns zero candidates to re-rank.
+- RRF fusion (k=60) avoids score-normalization between BM25 and cosine.
+- Vectors persist in the new `memory_embeddings` table with a content hash;
+  startup backfill (stale-checked) covers memories written or edited while
+  the flag was off. Writes are write-through; purge removes vectors.
+- Brute-force numpy cosine — single-digit ms at personal scale, documented
+  ceiling in KNOWN_LIMITATIONS.
+- Recall pipeline extracted to `chronos/ranking.py` (memory.py stays a thin
+  facade under the 400-line limit).
+- Tests inject a deterministic fake embedder (CI downloads nothing); a
+  real-model smoke test runs where the extra is installed. Verified locally
+  end-to-end with the real ONNX model.
+
+Honesty update: the README "no network" claim is now "no network by default" —
+the semantic flag's one-time model download is the sole, opt-in exception.
+
+---
+
 ## v4.0.0 — 2026-06-10
 
 Major release driven by a full adversarial audit of v3.3 (code quality, security,

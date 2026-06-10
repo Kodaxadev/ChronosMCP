@@ -103,6 +103,9 @@ def purge(memory_id: str) -> dict:
         db.execute(
             "DELETE FROM search_feedback WHERE memory_id = ?", (memory_id,)
         )
+        db.execute(
+            "DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,)
+        )
         # Legacy v3.x structural-vector table, present only in old DBs
         legacy = db.execute(
             "SELECT name FROM sqlite_master "

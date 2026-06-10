@@ -117,7 +117,7 @@ def test_memory_belief_consolidation_flow():
         assert report["phases_run"] == ["orient", "gather", "consolidate", "prune"]
 
         stats = await resources["chronos://stats"]()
-        assert "Schema version:       4.0" in stats
+        assert "Schema version:       4.1" in stats
         assert "Graph layer:          disabled" in stats
         assert "Memories (purged):    1" in stats
 

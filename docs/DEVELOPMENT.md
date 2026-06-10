@@ -72,7 +72,10 @@ Every source or markdown file must stay under 400 lines.
 - `chronos/db.py`: SQLite path, schema, migrations, FTS table + triggers
 - `chronos/search.py`: BM25 retrieval, MATCH sanitization, snapshot ranking,
   pairwise similarity
-- `chronos/memory.py`: remember / recall / get / update
+- `chronos/ranking.py`: recall pipeline — hybrid candidates, RRF fusion,
+  FSRS boost, response assembly
+- `chronos/semantic.py`: optional local embeddings (CHRONOS_SEMANTIC=1)
+- `chronos/memory.py`: remember / get / update + MemoryStore facade
 - `chronos/lifecycle.py`: forget / restore / purge
 - `chronos/time_travel.py`: historical memory reconstruction
 - `chronos/compression.py`: opt-in token-budget compression
@@ -97,9 +100,13 @@ mcp[cli]~=1.6
 numpy~=2.2
 ```
 
-numpy is used only by the flag-gated graph layer. Keep runtime dependencies
-sparse; prefer stdlib unless a new package removes meaningful complexity.
-Development-only tooling (pytest, ruff) is declared in the `dev` extra.
+numpy is used by the flag-gated graph layer and semantic search. Keep runtime
+dependencies sparse; prefer stdlib unless a new package removes meaningful
+complexity. Development-only tooling (pytest, ruff) is declared in the `dev`
+extra; the optional `semantic` extra (fastembed) is required only when
+`CHRONOS_SEMANTIC=1`. Semantic tests inject a fake `embed_fn` — CI never
+downloads a model; the real-model smoke test runs only where the extra is
+installed.
 
 ## Database Rules
 

@@ -2,7 +2,7 @@
 # Responsibility: Initialize schema, build singletons, register tools, run server.
 # No domain logic lives here. See chronos/ package for all implementation.
 #
-# Architecture: CHRONOS v4.0 — temporal memory layer for Claude
+# Architecture: CHRONOS v4.1 — temporal memory layer for Claude
 #   Core interface:      remember / recall / get_memory / forget /
 #                        restore_memory / purge_memory / update_memory /
 #                        related_memories / query_at
@@ -29,8 +29,8 @@ from chronos.memory import MemoryStore
 from chronos.tools import register
 
 
-def _graph_enabled() -> bool:
-    return os.environ.get("CHRONOS_ENABLE_GRAPH", "").lower() in ("1", "true", "yes")
+def _flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes")
 
 
 # ---------------------------------------------------------------------------
@@ -46,14 +46,28 @@ mcp = FastMCP("chronos")
 # 1. Apply DDL + migrations + FTS index/triggers once — not per connection
 init_db()
 
-# 2. Core singletons (stateless — all persistence lives in SQLite)
-mem_store            = MemoryStore()
+# 2. Optional semantic search — local ONNX embeddings, off by default.
+#    Construction fails loudly with install instructions if the extra is
+#    missing; the backfill embeds any memories written while the flag was
+#    off (first run on a large corpus downloads the model + takes minutes).
+semantic = None
+if _flag("CHRONOS_SEMANTIC"):
+    from chronos.semantic import SemanticSearch
+
+    semantic = SemanticSearch()
+    backfilled = semantic.backfill(check_stale=True)
+    if backfilled:
+        print(f"[chronos] semantic backfill: embedded {backfilled} memories",
+              flush=True)
+
+# 3. Core singletons (stateless — all persistence lives in SQLite)
+mem_store            = MemoryStore(semantic=semantic)
 belief_engine        = BeliefEngine()
 consolidation_engine = ConsolidationEngine(belief_engine)
 
-# 3. Optional graph layer — experimental, off by default
+# 4. Optional graph layer — experimental, off by default
 embedder = None
-if _graph_enabled():
+if _flag("CHRONOS_ENABLE_GRAPH"):
     from chronos.analysis_tools import register_analysis_tools
     from chronos.analyzers import CausalAnalyzer, ConstraintSolver, StructureAnalyzer
     from chronos.geometry import HyperbolicEmbedder
@@ -66,7 +80,7 @@ if _graph_enabled():
         mcp, CausalAnalyzer(), ConstraintSolver(), StructureAnalyzer()
     )
 
-# 4. Register core tools — single call wires all always-on sub-modules
+# 5. Register core tools — single call wires all always-on sub-modules
 register(
     mcp,
     mem_store,

@@ -23,7 +23,11 @@ Returns `{id, project, source, token_estimate}`.
 
 ### `recall`
 
-BM25 full-text search (porter-stemmed) with FSRS-aware re-ranking.
+BM25 full-text search (porter-stemmed) with FSRS-aware re-ranking. When the
+server runs with `CHRONOS_SEMANTIC=1`, retrieval is hybrid: BM25 and
+local-embedding nearest neighbors are merged with Reciprocal Rank Fusion,
+the response gains `retrieval: "hybrid_rrf"`, and vector-matched results
+carry a `semantic_similarity` field.
 
 | Param | Type | Default | Notes |
 |---|---|---|---|

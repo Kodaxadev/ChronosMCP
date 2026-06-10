@@ -8,17 +8,24 @@ unreachable-full-content problem no longer exist.)
 
 ---
 
-## Search is lexical, not semantic
+## Default search is lexical; semantic is opt-in
 
-`recall()` ranks with BM25 over porter-stemmed tokens. Morphological variants
-match ("deploying" ↔ "deploy"), but synonyms do not: a memory about "JWT token
-expiry" will not surface for "authentication session timeout" unless tokens
-overlap. This is the central trade-off of the zero-dependency design.
+Out of the box, `recall()` ranks with BM25 over porter-stemmed tokens.
+Morphological variants match ("deploying" ↔ "deploy"), but synonyms do not —
+unless you enable the `[semantic]` extra (`CHRONOS_SEMANTIC=1`), which fuses
+BM25 with local-embedding nearest neighbors via RRF (v4.1).
 
-The intended escape hatch is an optional embedding back-end (e.g. local ONNX
-sentence embeddings behind a flag) that re-ranks BM25 candidates. That work is
-scoped but not built; until then, write memories using the vocabulary you
-expect to search with.
+Hybrid mode's own boundaries:
+
+- The default model (bge-small-en-v1.5) is English-centric; other languages
+  degrade to whatever the model knows plus BM25.
+- First use downloads ~70MB from Hugging Face (the only network access in the
+  project, and only with this flag); first startup on an existing database
+  embeds the whole corpus, which takes minutes once.
+- Vector search is brute-force numpy — single-digit ms at 10k memories, but
+  no ANN index, so very large corpora would need one.
+- Memories edited while the flag was off carry stale vectors until the next
+  startup backfill (`check_stale=True` runs at every semantic startup).
 
 ## Token estimates are approximate
 

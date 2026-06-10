@@ -132,7 +132,26 @@ task suggestions (`suggest_next_tasks`) are worth it to you.
 | Variable | Default | Description |
 |---|---|---|
 | `CHRONOS_DB_PATH` | `./chronos.db` | Path to the SQLite database file |
+| `CHRONOS_SEMANTIC` | unset | Set to `1` for hybrid semantic search (needs the `[semantic]` extra) |
+| `CHRONOS_SEMANTIC_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model when semantic search is on |
 | `CHRONOS_ENABLE_GRAPH` | unset | Set to `1` to enable the experimental graph layer |
+
+### Optional: semantic search
+
+By default search is lexical (BM25 + porter stemming) — zero extra
+dependencies, instant startup. If you want "car" to find a memory about an
+*automobile*:
+
+```bash
+pip install "chronosmcp[semantic]"     # local ONNX model, no API keys, no torch
+```
+
+then set `CHRONOS_SEMANTIC=1` in the server env. Retrieval becomes **hybrid**:
+BM25 candidates and embedding nearest-neighbors (a ~70MB local model,
+downloaded once) are merged with Reciprocal Rank Fusion, so exact-term matches
+and meaning matches both surface. Results gain a `semantic_similarity` field.
+First startup on an existing database embeds your whole corpus — minutes,
+once; everything after is write-through and milliseconds.
 
 ---
 
@@ -152,8 +171,10 @@ reassuring:
   descriptions instruct Claude accordingly.
 - **Injection-safe queries.** Free text never reaches FTS5 MATCH syntax or SQL —
   queries are reduced to quoted terms, and every statement is parameterized.
-- **No network.** The server makes zero outbound connections. Verify it: the only
-  imports are `mcp`, `numpy`, and the standard library.
+- **No network by default.** The base server makes zero outbound connections —
+  the only imports are `mcp`, `numpy`, and the standard library. The one
+  exception is opt-in: `CHRONOS_SEMANTIC=1` downloads its embedding model from
+  Hugging Face once, after which inference is fully local.
 
 ---
 
@@ -178,9 +199,10 @@ faded become prune candidates. The system's beliefs converge toward what you
 actually use and verify — and every confidence change is written to an audit
 table, so you can always ask *why* it believes what it believes.
 
-Search is lexical (BM25 + stemming), not semantic — "JWT expiry" won't match
-"token timeout" unless words overlap. That's a deliberate zero-dependency
-trade-off, documented with the rest in
+Out of the box, search is lexical (BM25 + stemming) — a deliberate
+zero-dependency trade-off. The optional `[semantic]` extra upgrades recall to
+hybrid lexical+vector retrieval with a local model (see Configuration);
+remaining boundaries are documented in
 [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md).
 
 ---

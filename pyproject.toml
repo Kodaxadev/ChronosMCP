@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chronosmcp"
-version = "4.0.0"
+version = "4.1.0"
 description = "Temporal memory MCP server for Claude — BM25 search, time-travel queries, and FSRS-based forgetting. Local-first, zero cloud."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,11 @@ dependencies = [
 dev = [
     "pytest~=9.0",
     "ruff>=0.8"
+]
+# Local semantic search (CHRONOS_SEMANTIC=1): ONNX embeddings via fastembed.
+# No torch, no API keys; ~70MB model downloaded once on first use.
+semantic = [
+    "fastembed>=0.4"
 ]
 
 [tool.setuptools]

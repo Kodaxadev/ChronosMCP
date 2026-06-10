@@ -117,6 +117,16 @@ _DDL_STATEMENTS = [
         memory_id TEXT NOT NULL,
         purged_at TEXT NOT NULL
     )""",
+    # --- v4.1: semantic vectors (optional, populated only when
+    # CHRONOS_SEMANTIC=1). content_hash detects stale vectors after edits
+    # made while the flag was off; model allows clean model switches. ---
+    """CREATE TABLE IF NOT EXISTS memory_embeddings (
+        memory_id    TEXT PRIMARY KEY,
+        vector       BLOB NOT NULL,
+        dim          INTEGER NOT NULL,
+        model        TEXT NOT NULL,
+        content_hash TEXT NOT NULL
+    )""",
 ]
 
 # v4.0: FTS5 full-text index + sync triggers.

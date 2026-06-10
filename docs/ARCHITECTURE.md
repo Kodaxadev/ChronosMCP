@@ -30,12 +30,14 @@ application code doesn't update the index.
 chronos_mcp.py
   1. init_db()                      — DDL + column migrations + FTS table/
                                       triggers + one-time FTS backfill, WAL mode
-  2. MemoryStore()                  — stateless; no load step
-  3. BeliefEngine()                 — stateless FSRS/confidence math
-  4. ConsolidationEngine(beliefs)   — dream consolidation
-  5. [flag] HyperbolicEmbedder      — only when CHRONOS_ENABLE_GRAPH=1
-  6. register(...)                  — wire tool handlers to FastMCP
-  7. mcp.run()                      — enter asyncio event loop
+  2. [flag] SemanticSearch()        — only when CHRONOS_SEMANTIC=1; backfills
+                                      missing/stale vectors at startup
+  3. MemoryStore(semantic=…)        — stateless; no load step
+  4. BeliefEngine()                 — stateless FSRS/confidence math
+  5. ConsolidationEngine(beliefs)   — dream consolidation
+  6. [flag] HyperbolicEmbedder      — only when CHRONOS_ENABLE_GRAPH=1
+  7. register(...)                  — wire tool handlers to FastMCP
+  8. mcp.run()                      — enter asyncio event loop
 ```
 
 There is no index rebuild at startup. A v3.x database upgrades in place: column
@@ -68,12 +70,15 @@ before overwriting — this is what funds time-travel.
 cleans FTS), `memory_versions`, `belief_updates`, and `search_feedback`, then
 writes a content-free stub to `purge_log`.
 
-### Read path (recall)
+### Read path (recall — ranking.py)
 
 ```
 recall(query)
   → search.match_query()       free text → quoted OR-terms (injection-safe)
   → SELECT ... FROM memories_fts JOIN memories ... ORDER BY bm25(...)
+  → [CHRONOS_SEMANTIC=1] semantic.search(): normalized-dot-product over all
+    active vectors, then Reciprocal Rank Fusion with the BM25 list — meaning
+    matches surface even with zero lexical overlap
   → FSRS re-rank               score × (1 + w · retention · confidence_factor)
   → optional compression       ONLY when token_budget is set
 ```
@@ -118,9 +123,16 @@ detection), `estimate_tokens()`.
 
 ### Memory Pipeline
 
-**`chronos/memory.py`** — `MemoryStore`: remember, recall (with FSRS re-rank
-and opt-in compression), get, update. Stateless; delegates lifecycle and
-time-travel.
+**`chronos/memory.py`** — `MemoryStore`: remember, get, update, and the
+facade that delegates recall/lifecycle/time-travel. Write-through to the
+semantic index when one is injected.
+
+**`chronos/ranking.py`** — The recall pipeline: candidate retrieval (BM25 or
+hybrid), RRF fusion, FSRS boost, response assembly, opt-in compression.
+
+**`chronos/semantic.py`** — Optional (`CHRONOS_SEMANTIC=1`): local ONNX
+embeddings via fastembed, persisted in `memory_embeddings` with content
+hashes for stale detection; brute-force cosine search; startup backfill.
 
 **`chronos/lifecycle.py`** — forget (soft, reason persisted), restore, purge
 (hard, all tables).
@@ -178,6 +190,7 @@ matching, topological task ordering, connectivity analysis.
 |---|---|
 | `memories` | Content + project/tags/source/forget_reason + FSRS columns |
 | `memories_fts` | FTS5 index (porter), trigger-synced — never written by app code |
+| `memory_embeddings` | Semantic vectors + content hash (only populated when `CHRONOS_SEMANTIC=1`) |
 | `memory_versions` | Old content snapshots; funds query_at |
 | `belief_updates` | Audit trail of every confidence change |
 | `search_feedback` | Which recall results were actually used |
