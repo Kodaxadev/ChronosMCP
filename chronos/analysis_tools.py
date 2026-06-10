@@ -44,10 +44,19 @@ def register_analysis_tools(mcp: FastMCP, causal, solver, structure) -> None:
 
         Requires ≥3 nodes on each side of the treatment split.
 
-        Status in response:
-          'hypothesis'               — fewer than 10 matched pairs (unreliable)
-          'observational'            — 10–29 matched pairs
-          'counterfactual_validated' — 30+ matched pairs (spec threshold)
+        Returns: {
+            result_id:       uuid7 for this analysis (stored in causal_results),
+            ate:             average treatment effect (float, positive = treatment helps),
+            n:               number of matched pairs used,
+            status:          one of:
+              'hypothesis'               — <10 matched pairs (unreliable)
+              'observational'            — 10–29 matched pairs
+              'counterfactual_validated' — 30+ matched pairs (spec threshold),
+            confounder_used: which payload field was used for propensity matching,
+            interpretation:  human-readable summary string
+        }
+
+        On error returns: {error, status, treatment_n, control_n}
         """
         # Fetch data, close connection, then compute — avoids holding DB lock
         # during the O(n²) greedy matching pass.
@@ -121,11 +130,23 @@ def register_analysis_tools(mcp: FastMCP, causal, solver, structure) -> None:
         """
         Constraint solver: return the optimal order to work on tasks in a project.
 
-        Tasks are ordered by dependency constraints first, then by priority (lower = higher).
-        Only 'dependency' constraint_type is enforced — see add_constraint() for details.
+        Uses topological sort on dependency constraints, then sorts by priority
+        (lower number = higher priority). Only 'dependency' constraint_type is
+        enforced — see add_constraint() for details.
 
-        aggregate_id of tasks must match 'node:{project_id}:*' pattern.
-        payload must include 'project_id' field matching the project_id argument.
+        project_id: the project to scope. Tasks are matched by
+                    payload.project_id = project_id on node_created events.
+                    aggregate_id format must be 'node:{project_id}:{task_id}'.
+
+        Returns: {
+            suggested_order: list of up to 5 task titles (or ids if no title),
+            rationale:       human-readable explanation of ordering logic,
+            total_tasks:     number of tasks in the project,
+            ready_now:       number with no unresolved dependencies
+        }
+
+        If no tasks are found, returns {suggestion, count, hint} explaining how
+        to create tasks with the correct payload format.
         """
         # FIX #2: Fetch events and constraints separately to avoid duplicate
         # rows when a node has multiple constraints (LEFT JOIN multiplies rows).
@@ -192,11 +213,24 @@ def register_analysis_tools(mcp: FastMCP, causal, solver, structure) -> None:
         Graph connectivity analysis: find disconnected components and bottleneck nodes.
 
         Method: iterative DFS connected-components + degree-based bottleneck heuristic.
-        Note: This is NOT the full TDA/Mapper (gudhi Rips complex + persistence diagrams).
-        It provides graph-connectivity insight without external dependencies.
+        Note: This is NOT the full TDA/Mapper (gudhi Rips complex + persistence
+        diagrams). It provides graph-connectivity insight without external deps.
+
+        project_id: scope analysis to this project's nodes and edges.
+                    Only relation_added edges where BOTH source and target belong
+                    to this project are included. relation_removed edges are
+                    subtracted (deletions are respected).
 
         To build edges: emit add_event with event_type='relation_added' and
         payload={'source': '<aggregate_id>', 'target': '<aggregate_id>'}.
+
+        Returns: {
+            components:     list of node id groups (each group is a connected subgraph),
+            bottlenecks:    list of {node_id, degree} for high-connectivity nodes,
+            isolated_nodes: list of node ids with zero edges,
+            total_nodes:    count of active (non-tombstoned) nodes,
+            total_edges:    count of active edges
+        }
         """
         with get_db() as db:
             tombstoned = get_tombstoned_ids(db)

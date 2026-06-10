@@ -100,8 +100,6 @@ and a graph layer for structured project tracking.
 | Variable | Default | Description |
 |---|---|---|
 | `CHRONOS_DB_PATH` | `./chronos.db` | Path to the SQLite database file |
-| `CHRONOS_EMBED_MODEL` | *(none)* | HuggingFace model to enable `query_similar_memories` |
-| `CHRONOS_RECENCY_WEIGHT` | `0.3` | How much recent memories are boosted in `recall` (0.0 = pure relevance) |
 
 ---
 

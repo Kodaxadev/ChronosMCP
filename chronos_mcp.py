@@ -2,21 +2,28 @@
 # Responsibility: Initialize schema, build singletons, register tools, run server.
 # No domain logic lives here. See chronos/ package for all implementation.
 #
-# Architecture: CHRONOS v3.1 — zero-dependency Claude project memory layer
+# Architecture: CHRONOS v3.2 — zero-dependency Claude project memory layer
 # Primary interface: remember / recall / forget / query_at /
 #                    update_memory / query_similar_memories
+# Cognitive interface: set_confidence / boost_confidence / weaken_confidence /
+#                      review_memory / get_memory_health / log_search_feedback /
+#                      search_effectiveness / consolidate_memories
 # Advanced interface: add_event / query_similar / analyze_causal /
 #                     suggest_next_tasks / analyze_structure / add_constraint
 #
 # Module layout:
-#   tools.py          — memory tools (remember/recall/forget/query_at/stats) + register()
-#   graph_tools.py    — add_event, query_similar, add_constraint
-#   analysis_tools.py — analyze_causal, suggest_next_tasks, analyze_structure
-#   memory_tools.py   — update_memory, query_similar_memories
+#   tools.py               — memory tools + register() wiring point
+#   graph_tools.py         — add_event, query_similar, add_constraint
+#   analysis_tools.py      — analyze_causal, suggest_next_tasks, analyze_structure
+#   memory_tools.py        — update_memory, query_similar_memories
+#   belief_tools.py        — confidence scoring + FSRS review tools
+#   consolidation_tools.py — dream consolidation tool
 
 from mcp.server.fastmcp import FastMCP
 
 from chronos.analyzers import CausalAnalyzer, ConstraintSolver, StructureAnalyzer
+from chronos.beliefs import BeliefEngine
+from chronos.consolidation import ConsolidationEngine
 from chronos.db import init_db
 from chronos.geometry import HyperbolicEmbedder
 from chronos.mem_embed import MemoryEmbedder
@@ -34,7 +41,7 @@ mcp = FastMCP("chronos")
 # Startup: schema → singletons → tool registration
 # ---------------------------------------------------------------------------
 
-# 1. Apply DDL once — not on every connection
+# 1. Apply DDL + column migrations once — not on every connection
 init_db()
 
 # 2. Build singletons after DB is confirmed ready
@@ -51,8 +58,16 @@ mem_embedder = MemoryEmbedder(dim=32)
 mem_store    = MemoryStore(tfidf, mem_embedder=mem_embedder)
 mem_store.load()  # rebuilds TF-IDF index AND loads memory_vectors from DB
 
-# 4. Register all tools — single call wires all sub-modules
-register(mcp, embedder, causal, solver, structure, mem_store, mem_embedder)
+# 4. Cognitive subsystem: belief engine + dream consolidation
+belief_engine        = BeliefEngine()
+consolidation_engine = ConsolidationEngine(belief_engine, tfidf)
+
+# 5. Register all tools — single call wires all sub-modules
+register(
+    mcp, embedder, causal, solver, structure, mem_store, mem_embedder,
+    belief_engine=belief_engine,
+    consolidation_engine=consolidation_engine,
+)
 
 # ---------------------------------------------------------------------------
 # Run

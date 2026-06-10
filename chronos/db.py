@@ -90,13 +90,52 @@ _DDL_STATEMENTS = [
     )""",
     """CREATE INDEX IF NOT EXISTS idx_memory_versions_lookup
        ON memory_versions (memory_id, valid_from, valid_to)""",
+    # --- Cognitive subsystem tables (v3.2) ---
+    # Audit trail for confidence changes — one row per adjustment.
+    """CREATE TABLE IF NOT EXISTS belief_updates (
+        id             TEXT PRIMARY KEY,
+        memory_id      TEXT NOT NULL,
+        old_confidence REAL NOT NULL,
+        new_confidence REAL NOT NULL,
+        reason         TEXT NOT NULL,
+        updated_at     TEXT NOT NULL
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_belief_updates_memory
+       ON belief_updates (memory_id, updated_at)""",
+    # Search feedback for meta-learning — tracks which recall results get used.
+    """CREATE TABLE IF NOT EXISTS search_feedback (
+        id          TEXT PRIMARY KEY,
+        query       TEXT NOT NULL,
+        memory_id   TEXT NOT NULL,
+        used        INTEGER NOT NULL DEFAULT 0,
+        recalled_at TEXT NOT NULL
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_search_feedback_query
+       ON search_feedback (recalled_at)""",
 ]
+
+# Columns added in v3.2 — applied via ALTER TABLE after initial CREATE.
+# Each entry: (table, column, type_default). Idempotent: skipped if exists.
+_COLUMN_MIGRATIONS = [
+    ("memories", "confidence",    "REAL DEFAULT 0.5"),
+    ("memories", "stability",     "REAL DEFAULT 1.0"),
+    ("memories", "difficulty",    "REAL DEFAULT 0.5"),
+    ("memories", "last_reviewed", "TEXT"),
+    ("memories", "review_count",  "INTEGER DEFAULT 0"),
+]
+
+
+def _column_exists(conn, table: str, column: str) -> bool:
+    """Check if a column already exists on a table (for idempotent migrations)."""
+    info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row[1] == column for row in info)
 
 
 def init_db() -> None:
     """
     Apply schema DDL exactly once at server startup.
     Must be called before any tool handler runs.
+    Also applies column migrations (v3.2 cognitive subsystem).
     """
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -105,6 +144,12 @@ def init_db() -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         for stmt in _DDL_STATEMENTS:
             conn.execute(stmt)
+        # v3.2 column migrations — idempotent ALTER TABLE additions.
+        for table, column, type_default in _COLUMN_MIGRATIONS:
+            if not _column_exists(conn, table, column):
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {type_default}"
+                )
         conn.commit()
     finally:
         conn.close()

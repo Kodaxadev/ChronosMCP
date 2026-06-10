@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chronosmcp"
-version = "3.1.0"
+version = "3.3.0"
 description = "A persistent, hyperbolic knowledge graph and memory layer MCP server for Claude."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,15 @@ dependencies = [
     "numpy~=2.2"
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest~=9.0"
+]
+
 [tool.setuptools]
 packages = ["chronos"]
 py-modules = ["chronos_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

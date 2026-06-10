@@ -40,14 +40,24 @@ def register_graph_tools(mcp: FastMCP, embedder) -> None:
         """
         Add a node/event to the knowledge graph.
 
-        aggregate_id format: '{type}:{project}:{id}'  e.g. 'node:myproject:task_001'
-        event_type: one of node_created | node_updated | node_deleted | node_restored |
-                    relation_added | relation_removed | relation_updated
+        aggregate_id: format '{type}:{project}:{id}', e.g. 'node:myproject:task_001'.
+                      The project segment is used by suggest_next_tasks() and
+                      analyze_structure() for project scoping.
+        event_type:   one of:
+          - node_created     — creates node + auto-embeds for similarity search
+          - node_updated     — re-embeds with new payload features
+          - node_deleted     — tombstones node, removes from similarity search
+          - node_restored    — un-tombstones, restores to similarity index
+          - relation_added   — creates edge (payload: {source, target})
+          - relation_removed — removes edge (payload: {source, target})
+          - relation_updated — updates edge metadata
+        payload: dict of node features. For node_created/node_updated, embedding
+                 uses these keys: priority (int), tags (list), author (str),
+                 complexity (int). Missing keys default to 0/empty.
+                 For relation_added/removed: must include 'source' and 'target'
+                 aggregate_ids.
 
-        Auto-embeds on node_created and node_updated (embedding dimension may grow
-        if the node count crosses an adaptive threshold — see §4.1).
-        Writes tombstone on node_deleted and removes the node from similarity searches.
-        Restores tombstone and embedding index on node_restored.
+        Returns: event_id (uuid7 string) — use for audit trail and ordering.
         """
         validate_event(aggregate_id, event_type, payload)
         event_id = uuid7()
@@ -111,9 +121,17 @@ def register_graph_tools(mcp: FastMCP, embedder) -> None:
         Find the k most structurally similar nodes via hyperbolic distance.
         Tombstoned (deleted) nodes are automatically excluded.
 
-        Similarity is based on node payload features (priority, tag count, author,
-        complexity) — not content semantics. For memory content similarity,
-        use query_similar_memories() instead.
+        Similarity is based on node payload features (priority, tag count,
+        author, complexity) embedded in Poincaré ball space — NOT content
+        semantics. For keyword/content similarity, use recall(). For
+        content-vector similarity, use query_similar_memories().
+
+        node_id: aggregate_id of the reference node (must exist in graph).
+        k:       number of neighbors to return (default 5, max 50).
+
+        Returns: list of {node_id: str, distance: float} sorted by ascending
+        distance. Lower distance = more similar. Distance 0.0 = identical
+        features. Typical meaningful range: 0.0–2.0.
         """
         k = max(1, min(k, 50))
         with get_db() as db:

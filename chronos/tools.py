@@ -14,6 +14,8 @@ from typing import List
 from mcp.server.fastmcp import FastMCP
 
 from chronos.analysis_tools import register_analysis_tools
+from chronos.belief_tools import register_belief_tools
+from chronos.consolidation_tools import register_consolidation_tools
 from chronos.db import get_db
 from chronos.geometry import calculate_dimension
 from chronos.graph_tools import register_graph_tools
@@ -36,6 +38,7 @@ mcp = None
 def register(
     fastmcp: FastMCP,
     emb, csl, slv, stru, mem, mem_emb=None,
+    belief_engine=None, consolidation_engine=None,
 ) -> None:
     """
     Called once from chronos_mcp.py after all singletons are initialized.
@@ -48,6 +51,8 @@ def register(
     stru:    StructureAnalyzer
     mem:     MemoryStore
     mem_emb: MemoryEmbedder (optional — enables query_similar_memories)
+    belief_engine: BeliefEngine (optional — enables confidence/FSRS tools)
+    consolidation_engine: ConsolidationEngine (optional — enables dream mode)
     """
     global mcp, _embedder, _mem_store
     mcp        = fastmcp
@@ -58,6 +63,12 @@ def register(
     register_analysis_tools(fastmcp, csl, slv, stru)
     _register_memory_tools(fastmcp, mem)
     register_memory_tools(fastmcp, mem, mem_emb)
+
+    # v3.2: Cognitive subsystem tools
+    if belief_engine is not None:
+        register_belief_tools(fastmcp, belief_engine)
+    if consolidation_engine is not None:
+        register_consolidation_tools(fastmcp, consolidation_engine)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +105,7 @@ def _register_memory_tools(mcp_inst: FastMCP, mem_store) -> None:
         project: str = None,
         k: int = 5,
         recency_weight: float = 0.3,
+        token_budget: int = None,
     ) -> dict:
         """
         Retrieve the most relevant memories for a query.
@@ -107,16 +119,25 @@ def _register_memory_tools(mcp_inst: FastMCP, mem_store) -> None:
                         are boosted. 0.0 = pure TF-IDF ranking. 1.0 = strong
                         recency preference. Adjust down when you want the most
                         historically relevant memories regardless of age.
+        token_budget:   optional integer — max tokens for the entire response.
+                        When set, Chronos applies progressive compression:
+                          Tier 1: trim oversized individual results (>150 tok)
+                          Tier 2: drop lowest-scored results to fit budget
+                          Tier 3: summarize remaining long results to stubs
+                        Omit for uncompressed results. Recommended: 2000–6000
+                        depending on how much context window you can spare.
 
         Returns:
           results:      ranked list of {id, project, content, score, token_estimate}
           total_tokens: estimated tokens all results will consume in context
           count:        number of results returned
+          compression_applied: list of tiers used (only present when compressed)
         """
         k              = max(1, min(k, 20))
         recency_weight = max(0.0, min(1.0, recency_weight))
         return mem_store.recall(query, project=project, k=k,
-                                recency_weight=recency_weight)
+                                recency_weight=recency_weight,
+                                token_budget=token_budget)
 
     @mcp_inst.tool()
     async def forget(memory_id: str, reason: str = "manual") -> dict:
@@ -173,18 +194,32 @@ def _register_memory_tools(mcp_inst: FastMCP, mem_store) -> None:
             n_mem_vectors = db.execute(
                 "SELECT COUNT(*) FROM memory_vectors"
             ).fetchone()[0]
+            # v3.2: Cognitive subsystem stats
+            n_belief_updates = db.execute(
+                "SELECT COUNT(*) FROM belief_updates"
+            ).fetchone()[0]
+            n_feedback = db.execute(
+                "SELECT COUNT(*) FROM search_feedback"
+            ).fetchone()[0]
+            avg_confidence = db.execute(
+                "SELECT AVG(confidence) FROM memories WHERE forgotten = 0"
+            ).fetchone()[0]
 
         target_dim = calculate_dimension(n_nodes)
+        avg_conf_str = f"{avg_confidence:.3f}" if avg_confidence else "N/A"
         return (
             f"Memories (active):    {n_memories}\n"
             f"Memories (forgotten): {n_forgotten}\n"
             f"Memory vectors:       {n_mem_vectors}\n"
             f"TF-IDF indexed:       {mem_store.tfidf.doc_count()}\n"
+            f"Avg confidence:       {avg_conf_str}\n"
+            f"Belief updates:       {n_belief_updates}\n"
+            f"Search feedback:      {n_feedback}\n"
             f"Events:               {n_events}\n"
             f"Active nodes:         {n_nodes - n_tombstones}\n"
             f"Tombstoned nodes:     {n_tombstones}\n"
             f"Causal analyses:      {n_causal}\n"
             f"Constraints:          {n_constraints}\n"
             f"Embedding dim:        {_embedder.dim} (target: {target_dim})\n"
-            f"Schema version:       3.1"
+            f"Schema version:       3.3"
         )

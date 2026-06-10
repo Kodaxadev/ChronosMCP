@@ -12,10 +12,14 @@
 #   decide how many results to request without blindly inflating context.
 
 import json
+import math
 from datetime import datetime
 from typing import List, Optional
 
+from chronos.beliefs import BeliefEngine, CONFIDENCE_DEFAULT, STABILITY_DEFAULT
+from chronos.compression import compress_results
 from chronos.db import get_db
+from chronos.time_travel import query_at as _time_travel_query_at
 from chronos.tfidf import TFIDFIndex
 from chronos.uuid7 import uuid7
 
@@ -32,15 +36,43 @@ def _recency_factor(created_at_iso: str) -> float:
     """
     Returns 1/(1+days_old) — approaches 1 for brand-new, approaches 0 for old.
     Falls back to 0.0 if the timestamp cannot be parsed.
+    Legacy fallback used when FSRS data is unavailable.
     """
     try:
         created = datetime.fromisoformat(created_at_iso)
-        # Make both timezone-naive for diff
         now = datetime.now()
         days = max(0.0, (now - created.replace(tzinfo=None)).total_seconds() / 86400)
         return 1.0 / (1.0 + days)
     except (ValueError, TypeError):
         return 0.0
+
+
+def _fsrs_boost(stability: float, last_reviewed: str, created_at: str,
+                confidence: float) -> float:
+    """
+    FSRS-aware ranking boost. Combines retention probability with confidence.
+
+    Returns a value in [0, 1] that replaces the old recency_factor.
+    Higher when the memory is both confident AND well-retained.
+
+    Formula: boost = retention * confidence_factor
+      where retention = (1 + days/(9*S))^(-1)  [FSRS forgetting curve]
+      and confidence_factor = 0.5 + 0.5 * confidence  [scales 0.01→0.505, 0.99→0.995]
+
+    This means:
+      - A high-confidence, recently-reviewed memory gets maximum boost
+      - A low-confidence, stale memory gets almost no boost
+      - Confidence alone doesn't override staleness (and vice versa)
+    """
+    review_ts = last_reviewed or created_at
+    days = BeliefEngine.days_since(review_ts)
+    stab = stability if stability and stability > 0 else STABILITY_DEFAULT
+    retention = BeliefEngine.compute_retention(stab, days)
+
+    conf = confidence if confidence is not None else CONFIDENCE_DEFAULT
+    confidence_factor = 0.5 + 0.5 * conf
+
+    return retention * confidence_factor
 
 
 class MemoryStore:
@@ -133,6 +165,7 @@ class MemoryStore:
         project: Optional[str] = None,
         k: int = 5,
         recency_weight: float = _DEFAULT_RECENCY_WEIGHT,
+        token_budget: Optional[int] = None,
     ) -> dict:
         """
         Retrieve the k most relevant memories for a query.
@@ -163,21 +196,27 @@ class MemoryStore:
                     "SELECT id FROM memories WHERE forgotten = 1"
                 ).fetchall()
             }
-            # Fetch all candidate metadata in one shot (include created_at for decay)
+            # Fetch all candidate metadata in one shot.
+            # v3.2: also fetch FSRS columns for retention-aware ranking.
             if project:
                 rows = db.execute(
-                    """SELECT id, project, content, created_at FROM memories
+                    """SELECT id, project, content, created_at,
+                              confidence, stability, last_reviewed
+                       FROM memories
                        WHERE project = ? AND forgotten = 0""",
                     (project,),
                 ).fetchall()
             else:
                 rows = db.execute(
-                    """SELECT id, project, content, created_at FROM memories
-                       WHERE forgotten = 0"""
+                    """SELECT id, project, content, created_at,
+                              confidence, stability, last_reviewed
+                       FROM memories WHERE forgotten = 0"""
                 ).fetchall()
 
-        meta = {r[0]: {"project": r[1], "content": r[2], "created_at": r[3]}
-                for r in rows}
+        meta = {r[0]: {
+            "project": r[1], "content": r[2], "created_at": r[3],
+            "confidence": r[4], "stability": r[5], "last_reviewed": r[6],
+        } for r in rows}
 
         # Restrict TF-IDF search to this project's IDs if filtered.
         # exclude = all forgotten IDs plus all IDs NOT in this project's metadata.
@@ -191,14 +230,23 @@ class MemoryStore:
         fetch_k = k * 3 if recency_weight > 0 else k
         ranked  = self.tfidf.query(query, k=fetch_k, exclude=exclude)
 
-        # Apply recency boost and re-rank
+        # Apply FSRS-aware boost and re-rank.
+        # v3.2: uses retention * confidence instead of simple 1/(1+days) recency.
+        # Falls back to legacy recency_factor if FSRS columns are NULL (pre-v3.2 data).
         boosted = []
         for doc_id, score in ranked:
             if doc_id not in meta:
                 continue
             if recency_weight > 0:
-                rf    = _recency_factor(meta[doc_id]["created_at"])
-                score = score * (1.0 + recency_weight * rf)
+                m = meta[doc_id]
+                if m.get("stability") is not None:
+                    boost = _fsrs_boost(
+                        m["stability"], m["last_reviewed"],
+                        m["created_at"], m["confidence"],
+                    )
+                else:
+                    boost = _recency_factor(m["created_at"])
+                score = score * (1.0 + recency_weight * boost)
             boosted.append((doc_id, score))
 
         boosted.sort(key=lambda x: x[1], reverse=True)
@@ -208,16 +256,39 @@ class MemoryStore:
         total_tokens = _RECALL_OVERHEAD_TOKENS
 
         for doc_id, score in boosted:
-            content  = meta[doc_id]["content"]
+            m = meta[doc_id]
+            content  = m["content"]
             tok_est  = self.tfidf.estimate_tokens(content)
             total_tokens += tok_est
-            results.append({
+            entry = {
                 "id":             doc_id,
-                "project":        meta[doc_id]["project"],
+                "project":        m["project"],
                 "content":        content,
                 "score":          round(score, 5),
                 "token_estimate": tok_est,
-            })
+            }
+            # v3.2: include confidence in results when available
+            if m.get("confidence") is not None:
+                entry["confidence"] = round(m["confidence"], 4)
+            results.append(entry)
+
+        # v3.3: Apply token-budget compression when requested.
+        # Tier 1 (trim) always runs; Tier 2/3 only when budget is set.
+        if token_budget is not None or any(
+            r.get("token_estimate", 0) > 150 for r in results
+        ):
+            compressed = compress_results(
+                results,
+                budget=token_budget,
+                overhead=_RECALL_OVERHEAD_TOKENS,
+            )
+            return {
+                "results":              compressed["results"],
+                "total_tokens":         compressed["total_tokens"],
+                "count":                len(compressed["results"]),
+                "query":                query,
+                "compression_applied":  compressed["compression_applied"],
+            }
 
         return {
             "results":      results,
@@ -322,7 +393,7 @@ class MemoryStore:
         }
 
     # ------------------------------------------------------------------
-    # query_at — time-travel
+    # query_at — time-travel (delegated to time_travel.py)
     # ------------------------------------------------------------------
 
     def query_at(
@@ -336,124 +407,9 @@ class MemoryStore:
         Reconstruct which memories existed at `timestamp` and rank them
         against `query` using a fresh TF-IDF index over that snapshot.
 
-        timestamp: ISO 8601 string, e.g. '2026-03-01T00:00:00'
-        Memories created after `timestamp` are excluded.
-        Memories forgotten before `timestamp` are excluded.
+        Delegates to chronos.time_travel.query_at() — extracted to keep
+        this file under the 500-line hard limit.
 
         Returns same shape as recall() plus `as_of` field.
         """
-        if not query or not query.strip():
-            return {
-                "results": [], "total_tokens": 0,
-                "count": 0, "query": query, "as_of": timestamp,
-            }
-
-        # FIX: Validate timestamp is parseable ISO 8601 before using in SQL.
-        # Without this, garbage strings like "not_a_date" are silently accepted
-        # and produce unpredictable results via SQLite string comparison.
-        try:
-            parsed_ts = datetime.fromisoformat(timestamp)
-            # FIX: Strip timezone info for consistent lexicographic comparison
-            # against tz-naive stored timestamps. Without this, a tz-aware input
-            # like "2026-03-01T00:00:00+05:30" would sort incorrectly against
-            # tz-naive DB values due to the +/- suffix.
-            if parsed_ts.tzinfo is not None:
-                timestamp = parsed_ts.replace(tzinfo=None).isoformat()
-        except (ValueError, TypeError):
-            return {
-                "results": [], "total_tokens": 0, "count": 0,
-                "query": query, "as_of": timestamp,
-                "error": f"Invalid ISO 8601 timestamp: '{timestamp}'",
-            }
-
-        with get_db() as db:
-            if project:
-                rows = db.execute(
-                    """SELECT id, project, content, forgotten, updated_at
-                       FROM memories
-                       WHERE created_at <= ?
-                         AND project = ?""",
-                    (timestamp, project),
-                ).fetchall()
-            else:
-                rows = db.execute(
-                    """SELECT id, project, content, forgotten, updated_at
-                       FROM memories
-                       WHERE created_at <= ?""",
-                    (timestamp,),
-                ).fetchall()
-
-            # FIX #4: Load version history for candidate memories only.
-            # Scoped to the memory_ids from the main query (not the full table).
-            # FIX: Batch into chunks of 900 to stay under SQLite's
-            # SQLITE_MAX_VARIABLE_NUMBER limit (999 on older builds).
-            candidate_ids = [r[0] for r in rows]
-            version_rows = []
-            _BATCH = 900
-            for i in range(0, len(candidate_ids), _BATCH):
-                batch = candidate_ids[i:i + _BATCH]
-                placeholders = ",".join("?" * len(batch))
-                version_rows.extend(db.execute(
-                    f"""SELECT memory_id, content, valid_from, valid_to
-                        FROM memory_versions
-                        WHERE memory_id IN ({placeholders})
-                        ORDER BY valid_from ASC""",
-                    batch,
-                ).fetchall())
-
-        # Build version lookup: memory_id -> list of (content, valid_from, valid_to)
-        versions: dict = {}
-        for vr in version_rows:
-            vid, vcontent, vfrom, vto = vr
-            versions.setdefault(vid, []).append((vcontent, vfrom, vto))
-
-        # Exclude memories that were forgotten at or before the timestamp
-        snapshot: List[tuple] = []
-        for r in rows:
-            mem_id, proj, content, forgotten, updated_at = r
-            if forgotten and updated_at <= timestamp:
-                continue
-            # Resolve historical content: find the version active at timestamp.
-            # If a version's valid_from <= timestamp < valid_to, use that content.
-            # If no version matches, the current content was already current then.
-            if mem_id in versions:
-                for vcontent, vfrom, vto in versions[mem_id]:
-                    if vfrom <= timestamp < vto:
-                        content = vcontent
-                        break
-            snapshot.append((mem_id, content, proj))
-
-        if not snapshot:
-            return {
-                "results": [], "total_tokens": _RECALL_OVERHEAD_TOKENS,
-                "count": 0, "query": query, "as_of": timestamp,
-            }
-
-        # Build a temporary TF-IDF index over the snapshot
-        snap_index = TFIDFIndex()
-        snap_index.load_documents([(s[0], s[1]) for s in snapshot])
-        ranked = snap_index.query(query, k=k)
-
-        meta         = {s[0]: {"content": s[1], "project": s[2]} for s in snapshot}
-        results      = []
-        total_tokens = _RECALL_OVERHEAD_TOKENS
-
-        for doc_id, score in ranked:
-            content  = meta[doc_id]["content"]
-            tok_est  = snap_index.estimate_tokens(content)
-            total_tokens += tok_est
-            results.append({
-                "id":             doc_id,
-                "project":        meta[doc_id]["project"],
-                "content":        content,
-                "score":          round(score, 5),
-                "token_estimate": tok_est,
-            })
-
-        return {
-            "results":      results,
-            "total_tokens": total_tokens,
-            "count":        len(results),
-            "query":        query,
-            "as_of":        timestamp,
-        }
+        return _time_travel_query_at(TFIDFIndex, query, timestamp, project, k)
