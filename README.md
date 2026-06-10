@@ -1,11 +1,30 @@
 # Chronos MCP
 
-> Gives Claude a long-term memory and the ability to map out your projects.
+> The memory server that forgets responsibly — and can tell you what it used to believe.
 
+[![CI](https://github.com/Kodaxadev/ChronosMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/Kodaxadev/ChronosMCP/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Claude forgets everything when you start a new chat. You end up pasting the same context, rules, and project states over and over. Chronos fixes this by giving Claude a permanent, local memory it can search — and a structured graph it can use to track complex projects. Everything stays on your machine. No accounts, no APIs, no cloud.
+Claude forgets everything when you start a new chat. Most memory servers fix that by
+hoarding: everything saved forever, every recall dumped into context, no notion of
+whether a memory is still true. Chronos takes the opposite stance — memory that
+behaves like memory:
+
+- **Time-travel**: `query_at` reconstructs what Claude knew at any past timestamp,
+  including content that has since been edited. *"What did we know about the auth
+  system on March 1st?"* is a one-tool answer.
+- **Forgetting curves**: every memory carries a confidence score and an FSRS
+  retention model (the algorithm behind Anki). Unreviewed memories decay; confirmed
+  ones stabilize. `consolidate_memories` runs a four-phase "dream" pass that merges
+  duplicates, decays stale beliefs, and prunes what the system has lost faith in.
+- **Honest deletion**: `forget` hides (auditable, reversible), `purge` destroys
+  (content removed from every table, content-free audit stub left behind).
+
+Everything is one local SQLite file. No accounts, no API keys, no cloud, no
+embedding-model downloads. Search is SQLite's built-in FTS5/BM25 with porter
+stemming, kept in sync with content by database triggers — the index can't drift,
+even on a crash.
 
 ---
 
@@ -14,7 +33,7 @@ Claude forgets everything when you start a new chat. You end up pasting the same
 **1. Install**
 
 ```bash
-git clone https://github.com/you/ChronosMCP
+git clone https://github.com/Kodaxadev/ChronosMCP
 cd ChronosMCP
 pip install -e .
 ```
@@ -28,10 +47,8 @@ Open `claude_desktop_config.json` and add:
   "mcpServers": {
     "chronos": {
       "command": "python",
-      // Path to wherever you cloned ChronosMCP
       "args": ["/absolute/path/to/ChronosMCP/chronos_mcp.py"],
       "env": {
-        // Where Chronos saves your database. Defaults to chronos.db next to the script.
         "CHRONOS_DB_PATH": "/absolute/path/to/chronos.db"
       }
     }
@@ -57,41 +74,48 @@ What do you know about our Git workflow?
 
 What did you know about the auth system as of March 1st?
 
-Forget the note about the old staging URL.
+How confident are you in that memory about the rate limit?
 
-What tasks are blocking the payments feature right now?
+Run a consolidation pass and show me what's gone stale.
 
-What should I work on next in the api-rewrite project?
+Permanently delete the memory with my old API key in it.
 ```
 
 ---
 
 ## Tools
 
-Chronos gives Claude two distinct pipelines: a memory layer for free-text notes,
-and a graph layer for structured project tracking.
-
 ### Memory
 
 | Tool | What it does |
 |---|---|
-| `remember` | Saves a note, decision, or code snippet. Accepts optional `project` and `tags`. |
-| `recall` | Finds the most relevant memories for a query. Blends keyword relevance with recency. |
-| `forget` | Hides a memory from future searches. The record stays in the DB for history. |
-| `update_memory` | Rewrites a memory's content. The previous version is snapshotted automatically. |
-| `query_at` | Time-travel recall — reconstructs what Claude knew at any past timestamp. |
-| `query_similar_memories` | Finds conceptually related memories using embedding similarity, not just tags. |
+| `remember` | Saves a note with optional `project`, `tags`, and `source` provenance. |
+| `recall` | BM25 + stemming search, re-ranked by FSRS retention × confidence. Optional `token_budget` for compressed results. |
+| `get_memory` | Fetches one memory in full by id — never truncated. |
+| `update_memory` | Rewrites content; the old version is snapshotted for time-travel. |
+| `related_memories` | "More like this" — finds memories sharing distinctive vocabulary. |
+| `query_at` | Time-travel recall at any past timestamp, resolving edited content. |
+| `forget` / `restore_memory` | Reversible soft-delete with a persisted reason. |
+| `purge_memory` | Irreversible hard-delete of content everywhere it lives. |
 
-### Graph
+### Cognition
 
 | Tool | What it does |
 |---|---|
-| `add_event` | Adds a structured node (task, decision, sprint) to the knowledge graph. |
-| `add_constraint` | Links two nodes so Claude understands what must happen first. |
-| `suggest_next_tasks` | Reads the dependency graph and surfaces what's unblocked and ready to work on. |
-| `query_similar` | Finds related nodes by complexity, priority, and graph position. |
-| `analyze_structure` | Spots bottlenecks, orphaned nodes, and dependency cycles in your project. |
-| `analyze_causal` | Estimates the real-world impact of a change by analyzing outcome patterns across tasks. |
+| `set_confidence` / `boost_confidence` / `weaken_confidence` | Evidence-driven trust scoring (0.01–0.99) with a full audit trail. |
+| `review_memory` | FSRS review — strengthens a memory's stability so it decays slower. |
+| `get_memory_health` | Confidence, retention probability, review history for one memory. |
+| `log_search_feedback` / `search_effectiveness` | Tracks which recalls actually got used; recommends tuning. |
+| `consolidate_memories` | Four-phase dream pass: orient → gather duplicates → merge/decay/flag → prune. Dry-run by default. |
+
+### Graph (experimental, off by default)
+
+An event-sourced project graph (tasks, dependencies, causal analysis over
+outcomes) ships behind `CHRONOS_ENABLE_GRAPH=1`. It is quarantined rather than
+deleted: the structural-similarity signal proved weak in practice (see
+[docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md)), and the core memory
+server is better without the surface area. Enable it if dependency-ordered
+task suggestions (`suggest_next_tasks`) are worth it to you.
 
 ---
 
@@ -100,26 +124,70 @@ and a graph layer for structured project tracking.
 | Variable | Default | Description |
 |---|---|---|
 | `CHRONOS_DB_PATH` | `./chronos.db` | Path to the SQLite database file |
+| `CHRONOS_ENABLE_GRAPH` | unset | Set to `1` to enable the experimental graph layer |
+
+---
+
+## Security Model — read this once
+
+Chronos is a **local, single-user** tool. Its threat model is honest rather than
+reassuring:
+
+- **Plaintext at rest.** The database is an unencrypted SQLite file. Anything you
+  ask Claude to remember — including secrets, if you do that — sits in plaintext on
+  disk. Don't store credentials; if you must remove something, use `purge_memory`,
+  not `forget` (forget retains content for audit and time-travel).
+- **Memories are data, not instructions.** Recall results carry a `source` field
+  (`user`, `claude`, `web`, `document`). Content that originated outside the
+  conversation should never be followed as a directive — a poisoned memory is a
+  persistent prompt injection, and provenance is your tripwire. The tool
+  descriptions instruct Claude accordingly.
+- **Injection-safe queries.** Free text never reaches FTS5 MATCH syntax or SQL —
+  queries are reduced to quoted terms, and every statement is parameterized.
+- **No network.** The server makes zero outbound connections. Verify it: the only
+  imports are `mcp`, `numpy`, and the standard library.
 
 ---
 
 ## How It Works
 
-When you ask Claude to remember something, Chronos writes it to a local SQLite file and
-indexes it using TF-IDF — no dependencies, no model downloads required. `recall` ranks
-results by relevance and applies a gentle recency boost so newer memories surface first
-without burying highly relevant older ones.
+`remember` writes one row. A SQLite trigger indexes it into an FTS5 table in the
+same transaction — there is no in-memory index, no startup rebuild, and no window
+where the database and the search index disagree. `recall` ranks with BM25
+(porter-stemmed), then re-ranks by an FSRS boost: memories that are confident
+*and* recently confirmed surface first, while stale unverified ones sink.
 
-For project tracking, Chronos organizes nodes in a hyperbolic space rather than a flat
-list. This means closely related tasks cluster naturally together even as your graph
-grows — the geometry handles the relationships so you don't have to label everything
-manually.
+`update_memory` snapshots the old content into a version table before
+overwriting. `query_at` replays that history: it selects the memories that
+existed at the requested instant, resolves each one's content as of that moment,
+and ranks the reconstructed snapshot with an ephemeral BM25 index — so past and
+present searches score the same way.
 
-`query_at` time-travels by reconstructing a snapshot of your memory database at any
-past timestamp, including resolving content that's since been edited. The database is a
-single local file. Back it up however you back up files.
+The cognitive layer is the part that makes Chronos different over months of use.
+Memories you confirm get more stable (slower decay); memories that sit unreviewed
+lose confidence on every consolidation pass; memories that are both untrusted and
+faded become prune candidates. The system's beliefs converge toward what you
+actually use and verify — and every confidence change is written to an audit
+table, so you can always ask *why* it believes what it believes.
+
+Search is lexical (BM25 + stemming), not semantic — "JWT expiry" won't match
+"token timeout" unless words overlap. That's a deliberate zero-dependency
+trade-off, documented with the rest in
+[docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md).
 
 ---
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -v        # 48 tests
+ruff check .
+```
+
+CI runs the suite on Linux and Windows across Python 3.10/3.12/3.14.
+Architecture notes live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md);
+the v3.3 → v4.0 redesign rationale is in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

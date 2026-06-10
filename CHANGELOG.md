@@ -4,6 +4,94 @@ All notable changes to ChronosMCP are documented here. Entries are ordered newes
 
 ---
 
+## v4.0.0 — 2026-06-10
+
+Major release driven by a full adversarial audit of v3.3 (code quality, security,
+competitive landscape). Three confirmed bugs fixed with regression tests, the
+search engine replaced, the graph layer quarantined, and the project repositioned
+around its two genuinely differentiated capabilities: time-travel and FSRS-based
+forgetting. **Breaking changes** are marked.
+
+### Search engine: TF-IDF → SQLite FTS5/BM25
+
+The in-memory pure-Python TF-IDF index is gone. Search now uses an FTS5 virtual
+table (`memories_fts`, porter stemming) maintained by SQLite **triggers**, so index
+updates commit atomically with the content writes they mirror. This removes, by
+construction, the v3.3 documented "DB and index can disagree until restart"
+window, the O(N) startup rebuild, and the manual index-update calls scattered
+through every write path. Ranking is BM25; recall scores are now relative ranking
+values rather than [0,1] cosines (**breaking** if you compared scores across
+versions). Existing databases are backfilled automatically on first start.
+
+### Confirmed v3.3 bugs fixed (each with a regression test)
+
+- **`add_event` resize deadlock.** `maybe_resize()` opened a second connection and
+  committed while `add_event` held the write lock — the first resize past the
+  257-node threshold failed with `database is locked` (verified by repro). The
+  resize now runs before the write transaction opens.
+- **Silent recall truncation.** v3.3 trimmed any result over ~150 tokens even when
+  no budget was requested, and offered no tool to fetch full content — long
+  memories were unreadable through the MCP interface. Compression now runs only
+  when `token_budget` is set, and the new `get_memory` tool returns full content
+  by id. Tier-3 summarize thresholds are now budget-derived.
+- **Forgotten memories leaking from the vector index.** Consolidation merge/prune
+  removed TF-IDF entries but not structural vectors, so `query_similar_memories`
+  kept returning forgotten memories forever. The structural vector index is
+  removed entirely (see below); forgotten rows leave search via trigger in the
+  same transaction.
+- **Degenerate embedding normalization.** Per-vector min-max scaling mapped any
+  two proportional node payloads to the identical embedding. Replaced with fixed
+  per-feature scales.
+
+### New tools
+
+- `get_memory` — full single-memory retrieval, never truncated.
+- `restore_memory` — un-forget (v3.3's error messages referenced a restore that
+  didn't exist).
+- `purge_memory` — irreversible hard-delete of content from every table
+  (memories, versions, FTS, audit rows), leaving a content-free `purge_log` stub.
+  `forget` vs `purge` is now an honest distinction.
+- `related_memories` — BM25 "more like this" using a memory's own distinctive
+  vocabulary. **Replaces `query_similar_memories`** (breaking), whose structural
+  5-feature similarity surfaced same-*length* memories, not related ones.
+
+### Security
+
+- `source` provenance column on memories (`user`/`claude`/`web`/`document`),
+  echoed in recall results; tool descriptions direct the model to treat
+  externally-sourced content as data, not instructions (memory-poisoning tripwire).
+- `forget(reason=...)` is now persisted (`forget_reason` column) instead of
+  being silently discarded.
+- FTS MATCH input is sanitized to quoted terms — query-syntax injection is
+  structurally impossible; all SQL remains parameterized.
+- README gained an explicit threat-model section (plaintext at rest, forget vs
+  purge, no-network guarantee).
+
+### Graph layer quarantined (**breaking**)
+
+`add_event`, `query_similar`, `add_constraint`, `analyze_causal`,
+`suggest_next_tasks`, and `analyze_structure` are now registered only when
+`CHRONOS_ENABLE_GRAPH=1`. The audit found the structural-similarity premise weak
+and the causal tooling rarely usable on real payloads; the layer stays available
+for users who want it, but the default server is the focused memory product.
+
+### Architecture
+
+- `MemoryStore` is stateless; `chronos/search.py` owns retrieval,
+  `chronos/lifecycle.py` owns forget/restore/purge, `chronos/consolidation_scan.py`
+  owns read-only consolidation phases. `tfidf.py` and `mem_embed.py` deleted.
+- `db_path()` resolves `CHRONOS_DB_PATH` at call time (testability).
+- Schema migrations are additive and idempotent; pre-v4 databases upgrade in
+  place on first start.
+
+### Tooling
+
+- Test suite rewritten: 4 → 48 tests across 8 files, including regression tests
+  for every audit finding and FTS injection attempts.
+- GitHub Actions CI: Linux + Windows × Python 3.10/3.12/3.14, ruff + pytest.
+
+---
+
 ## v3.1 — 2026-03-30
 
 Schema version bump from 3.0 → 3.1. Comprehensive audit pass covering error handling, data integrity, input boundaries, resource lifecycle, and API contract compliance. 13 bugs confirmed via reproduction scripts; all critical and medium-severity issues fixed.

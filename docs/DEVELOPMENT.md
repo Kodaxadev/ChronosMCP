@@ -1,14 +1,16 @@
-# CHRONOS v3.3 Development Guide
+# CHRONOS v4.0 Development Guide
 
 ## Prerequisites
 
-- Python 3.10 or later
+- Python 3.10 or later, from a standard build (SQLite with FTS5 — python.org,
+  conda, and OS packages all qualify; the server fails loudly at startup if
+  FTS5 is missing)
 - pip or uv
 
 ## Setup
 
 ```bash
-git clone <repo>
+git clone https://github.com/Kodaxadev/ChronosMCP
 cd ChronosMCP
 pip install -e ".[dev]"
 ```
@@ -36,22 +38,23 @@ $env:CHRONOS_DB_PATH = "C:\path\to\dev.db"
 python chronos_mcp.py
 ```
 
-## Testing
+Enable the experimental graph layer with `CHRONOS_ENABLE_GRAPH=1`.
 
-Run the normal test suite through pytest:
-
-```bash
-python -m pytest -q
-```
-
-Compile-check importable modules:
+## Testing & Linting
 
 ```bash
-python -m compileall -q chronos chronos_mcp.py tests
+python -m pytest -q     # 48 tests; each gets a fresh temp database (conftest.py)
+ruff check .            # must be clean — CI enforces it
 ```
 
-The tests set `CHRONOS_DB_PATH` to a temporary SQLite file before importing the
-application modules, so they do not mutate a real Chronos database.
+CI (`.github/workflows/ci.yml`) runs both on Linux + Windows across
+Python 3.10 / 3.12 / 3.14. Tests never touch a real Chronos database:
+`db.db_path()` resolves `CHRONOS_DB_PATH` at call time and the autouse
+fixture points it at `tmp_path`.
+
+When you fix a bug, add a regression test in the matching `tests/test_*.py`
+file and name it after the failure mode (see
+`test_add_event_during_resize_does_not_deadlock` for the pattern).
 
 ## File Limits
 
@@ -63,33 +66,23 @@ Every source or markdown file must stay under 400 lines.
 | 300 lines | Review for split opportunities |
 | 400 lines | Hard limit: create a new module first |
 
-Check line counts with:
-
-```powershell
-Get-ChildItem -Recurse -File -Include *.py,*.md,*.toml |
-  Where-Object { $_.FullName -notmatch '\\.venv\\|__pycache__|\\.git\\' } |
-  ForEach-Object {
-    $lines = (Get-Content -LiteralPath $_.FullName | Measure-Object -Line).Lines
-    if ($lines -gt 400) { "$lines $($_.FullName)" }
-  }
-```
-
 ## Module Ownership
 
-- `chronos_mcp.py`: startup orchestration only
-- `chronos/db.py`: SQLite path, schema, connection lifecycle
-- `chronos/uuid7.py`: ID generation
-- `chronos/validation.py`: event validation
-- `chronos/memory.py`: memory lifecycle
+- `chronos_mcp.py`: startup orchestration + graph-layer gating only
+- `chronos/db.py`: SQLite path, schema, migrations, FTS table + triggers
+- `chronos/search.py`: BM25 retrieval, MATCH sanitization, snapshot ranking,
+  pairwise similarity
+- `chronos/memory.py`: remember / recall / get / update
+- `chronos/lifecycle.py`: forget / restore / purge
 - `chronos/time_travel.py`: historical memory reconstruction
-- `chronos/compression.py`: recall token-budget compression
-- `chronos/tfidf.py`: keyword retrieval index
-- `chronos/mem_embed.py`: structural memory vectors
-- `chronos/geometry.py`: Poincare ball geometry and node embeddings
-- `chronos/analyzers.py`: causal, graph structure, and dependency analysis
+- `chronos/compression.py`: opt-in token-budget compression
 - `chronos/beliefs.py`: confidence and FSRS state logic
-- `chronos/consolidation.py`: memory maintenance workflow
+- `chronos/consolidation.py`: consolidation mutations (merge/decay/prune)
+- `chronos/consolidation_scan.py`: consolidation read-only scans
 - `chronos/consolidation_config.py`: consolidation thresholds
+- `chronos/uuid7.py`: ID generation
+- `chronos/validation.py`: graph event validation
+- `chronos/geometry.py`, `chronos/analyzers.py`: graph layer (flag-gated)
 - `chronos/*_tools.py`: MCP tool registration for each subsystem
 
 When adding behavior, choose the owning module first. If no existing module owns
@@ -104,21 +97,24 @@ mcp[cli]~=1.6
 numpy~=2.2
 ```
 
-Development-only tooling is declared in the `dev` extra. Keep runtime
-dependencies sparse; prefer stdlib plus numpy unless a new package removes
-meaningful complexity.
+numpy is used only by the flag-gated graph layer. Keep runtime dependencies
+sparse; prefer stdlib unless a new package removes meaningful complexity.
+Development-only tooling (pytest, ruff) is declared in the `dev` extra.
 
 ## Database Rules
 
 - Call `init_db()` once at startup before registering tools.
 - Use `get_db()` for per-operation connections.
-- Commit DB writes before updating in-memory indexes.
-- Keep schema migrations idempotent.
+- **Never write to `memories_fts` directly** — the triggers in db.py are the
+  only write path (the one-time backfill in `init_db()` is the sole exception).
+- Never open a second write connection while a write transaction is in
+  flight (this is the deadlock class fixed in v4.0 — see graph_tools.add_event).
+- Keep schema migrations additive and idempotent.
 - Never write real secrets or tokens into tests, docs, or fixtures.
 
 ## Before Finishing Work
 
-1. Run `python -m pytest -q`.
-2. Run `python -m compileall -q chronos chronos_mcp.py tests`.
-3. Check file line counts.
+1. `python -m pytest -q` — all green.
+2. `ruff check .` — clean.
+3. Check file line counts (400 hard limit).
 4. Review `git status --short`.
