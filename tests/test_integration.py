@@ -6,8 +6,8 @@ import asyncio
 
 from mcp.server.fastmcp import FastMCP
 
-from chronos.analyzers import CausalAnalyzer, ConstraintSolver, StructureAnalyzer
 from chronos.analysis_tools import register_analysis_tools
+from chronos.analyzers import CausalAnalyzer, ConstraintSolver, StructureAnalyzer
 from chronos.beliefs import BeliefEngine
 from chronos.consolidation import ConsolidationEngine
 from chronos.geometry import HyperbolicEmbedder

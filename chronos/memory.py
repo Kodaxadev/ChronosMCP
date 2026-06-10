@@ -23,7 +23,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from chronos import lifecycle
-from chronos.beliefs import BeliefEngine, CONFIDENCE_DEFAULT, STABILITY_DEFAULT
+from chronos.beliefs import CONFIDENCE_DEFAULT, STABILITY_DEFAULT, BeliefEngine
 from chronos.compression import compress_results
 from chronos.db import get_db
 from chronos.search import estimate_tokens, search_memories

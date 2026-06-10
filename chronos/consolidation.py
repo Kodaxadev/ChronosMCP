@@ -26,7 +26,7 @@
 from datetime import datetime
 from typing import List, Optional
 
-from chronos.beliefs import BeliefEngine, CONFIDENCE_DEFAULT, CONFIDENCE_MIN
+from chronos.beliefs import CONFIDENCE_DEFAULT, CONFIDENCE_MIN, BeliefEngine
 from chronos.consolidation_config import (
     STALE_DAYS_THRESHOLD,
     STALE_DECAY_DELTA,

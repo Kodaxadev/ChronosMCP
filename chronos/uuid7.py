@@ -2,8 +2,8 @@
 # Responsibility: RFC 9562 compliant UUIDv7 generation.
 # Single function, zero dependencies beyond stdlib.
 
-import time
 import secrets
+import time
 
 
 def uuid7() -> str:

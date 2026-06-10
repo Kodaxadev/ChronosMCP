@@ -9,7 +9,7 @@
 
 from typing import List, Optional
 
-from chronos.beliefs import BeliefEngine, CONFIDENCE_DEFAULT, STABILITY_DEFAULT
+from chronos.beliefs import CONFIDENCE_DEFAULT, STABILITY_DEFAULT, BeliefEngine
 from chronos.consolidation_config import (
     DUPLICATE_THRESHOLD,
     PRUNE_CONFIDENCE_THRESHOLD,

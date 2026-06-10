@@ -11,7 +11,6 @@ from datetime import datetime
 from typing import List
 
 import numpy as np
-
 from mcp.server.fastmcp import FastMCP
 
 from chronos.db import get_db, get_tombstoned_ids

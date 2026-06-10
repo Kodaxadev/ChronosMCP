@@ -2,10 +2,10 @@
 # FSRS math properties, confidence clamping, review cycle, feedback stats.
 
 from chronos.beliefs import (
-    BeliefEngine,
     CONFIDENCE_MAX,
     CONFIDENCE_MIN,
     STABILITY_GROWTH,
+    BeliefEngine,
 )
 from chronos.memory import MemoryStore
 
@@ -16,7 +16,7 @@ def test_retention_curve_properties():
     assert eng.compute_retention(1.0, 0.0) == 1.0
     # Monotonically decreasing in elapsed days
     r = [eng.compute_retention(1.0, d) for d in (0, 1, 5, 30, 365)]
-    assert all(a > b for a, b in zip(r, r[1:]))
+    assert all(a > b for a, b in zip(r, r[1:], strict=False))
     # Higher stability retains longer
     assert eng.compute_retention(10.0, 30) > eng.compute_retention(1.0, 30)
     # Degenerate stability floors out instead of dividing by zero

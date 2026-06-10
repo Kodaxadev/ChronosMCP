@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chronosmcp"
-version = "3.3.0"
-description = "A persistent, hyperbolic knowledge graph and memory layer MCP server for Claude."
+version = "4.0.0"
+description = "Temporal memory MCP server for Claude — BM25 search, time-travel queries, and FSRS-based forgetting. Local-first, zero cloud."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -19,7 +19,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest~=9.0"
+    "pytest~=9.0",
+    "ruff>=0.8"
 ]
 
 [tool.setuptools]
@@ -29,3 +30,17 @@ py-modules = ["chronos_mcp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Defaults (E4/E7/E9 + F) plus import hygiene and common bug patterns
+select = ["E4", "E7", "E9", "F", "B", "I"]
+ignore = [
+    "E731",  # lambda assignment — used deliberately in tests
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["chronos"]

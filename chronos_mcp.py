@@ -54,8 +54,8 @@ consolidation_engine = ConsolidationEngine(belief_engine)
 # 3. Optional graph layer — experimental, off by default
 embedder = None
 if _graph_enabled():
-    from chronos.analyzers import CausalAnalyzer, ConstraintSolver, StructureAnalyzer
     from chronos.analysis_tools import register_analysis_tools
+    from chronos.analyzers import CausalAnalyzer, ConstraintSolver, StructureAnalyzer
     from chronos.geometry import HyperbolicEmbedder
     from chronos.graph_tools import register_graph_tools
 

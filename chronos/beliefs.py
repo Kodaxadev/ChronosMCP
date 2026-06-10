@@ -14,7 +14,6 @@
 #   FSRS-6: https://github.com/open-spaced-repetition/fsrs4anki/wiki/Algorithm
 #   Austin 2011 caliper: 0.5 SD (used by CausalAnalyzer, consistency)
 
-import json
 import math
 from datetime import datetime
 from typing import Optional
@@ -287,7 +286,6 @@ class BeliefEngine:
         Returns hit rate (used/total) and recommendation for recency_weight.
         """
         with get_db() as db:
-            cutoff = datetime.now()
             # Simple approach: count total and used in recent window
             rows = db.execute(
                 """SELECT COUNT(*) as total,

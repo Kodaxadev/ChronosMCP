@@ -104,7 +104,7 @@ class CausalAnalyzer:
         used    = set()
         for t_node, t_score in t_norm:
             best, best_dist = None, float("inf")
-            for i, (c_node, c_score) in enumerate(c_norm):
+            for i, (_c_node, c_score) in enumerate(c_norm):
                 if i in used:
                     continue
                 dist = abs(t_score - c_score)
