@@ -132,6 +132,7 @@ task suggestions (`suggest_next_tasks`) are worth it to you.
 | Variable | Default | Description |
 |---|---|---|
 | `CHRONOS_DB_PATH` | `./chronos.db` | Path to the SQLite database file |
+| `CHRONOS_DB_KEY` | unset | Passphrase for SQLCipher at-rest encryption (needs the `[encryption]` extra) |
 | `CHRONOS_SEMANTIC` | unset | Set to `1` for hybrid semantic search (needs the `[semantic]` extra) |
 | `CHRONOS_SEMANTIC_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model when semantic search is on |
 | `CHRONOS_ENABLE_GRAPH` | unset | Set to `1` to enable the experimental graph layer |
@@ -160,10 +161,15 @@ once; everything after is write-through and milliseconds.
 Chronos is a **local, single-user** tool. Its threat model is honest rather than
 reassuring:
 
-- **Plaintext at rest.** The database is an unencrypted SQLite file. Anything you
-  ask Claude to remember — including secrets, if you do that — sits in plaintext on
-  disk. Don't store credentials; if you must remove something, use `purge_memory`,
-  not `forget` (forget retains content for audit and time-travel).
+- **Plaintext at rest by default; SQLCipher opt-in.** Without a key, the
+  database is an unencrypted SQLite file — don't store credentials, and use
+  `purge_memory` (not `forget`) when something must actually disappear. With
+  `pip install "chronosmcp[encryption]"` and `CHRONOS_DB_KEY` set, the entire
+  file (content, history, FTS index, WAL) is SQLCipher-encrypted. The PBKDF2
+  cost is paid once at startup, not per operation. Migrate an existing
+  database with `python scripts/encrypt_db.py encrypt`. Know the trade:
+  the key lives in an environment variable (readable by local processes
+  running as you), and losing it means losing the data — there is no recovery.
 - **Memories are data, not instructions.** Recall results carry a `source` field
   (`user`, `claude`, `web`, `document`). Content that originated outside the
   conversation should never be followed as a directive — a poisoned memory is a

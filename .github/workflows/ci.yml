@@ -29,3 +29,23 @@ jobs:
 
       - name: Test
         run: pytest tests/ -v
+
+  encryption:
+    name: encryption extra (py3.12, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package + encryption extra
+        run: pip install -e ".[dev,encryption]"
+
+      - name: Test encryption paths
+        run: pytest tests/test_encryption.py -v

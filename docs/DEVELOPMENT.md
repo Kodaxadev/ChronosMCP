@@ -104,9 +104,11 @@ numpy is used by the flag-gated graph layer and semantic search. Keep runtime
 dependencies sparse; prefer stdlib unless a new package removes meaningful
 complexity. Development-only tooling (pytest, ruff) is declared in the `dev`
 extra; the optional `semantic` extra (fastembed) is required only when
-`CHRONOS_SEMANTIC=1`. Semantic tests inject a fake `embed_fn` — CI never
-downloads a model; the real-model smoke test runs only where the extra is
-installed.
+`CHRONOS_SEMANTIC=1`, and the `encryption` extra (sqlcipher3-wheels) only
+when `CHRONOS_DB_KEY` is set. Semantic tests inject a fake `embed_fn` — CI
+never downloads a model; the real-model smoke test runs only where the extra
+is installed. Encryption tests skip without the driver and run in CI's
+dedicated encryption job (Linux + Windows).
 
 ## Database Rules
 

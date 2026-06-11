@@ -6,6 +6,7 @@
 # so index updates commit atomically with the content writes they mirror.
 # There is no in-memory index, no startup rebuild, and no consistency window.
 
+import hashlib
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -14,11 +15,112 @@ _DEFAULT_DB_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "chronos.db"
 )
 
+_ENCRYPTION_HINT = (
+    "CHRONOS_DB_KEY is set but the encryption driver is missing. "
+    'Fix: pip install "chronosmcp[encryption]" '
+    "(SQLCipher wheels — no compiler needed)"
+)
+
+_KEY_MISMATCH_HINT = (
+    "Could not read the database with the current CHRONOS_DB_KEY setting. "
+    "One of: (a) the key is wrong; (b) the database is plaintext but "
+    "CHRONOS_DB_KEY is set — encrypt it first with "
+    "`python scripts/encrypt_db.py encrypt`; (c) the database is encrypted "
+    "but CHRONOS_DB_KEY is unset."
+)
+
 
 def db_path() -> str:
     """Resolve the DB path at call time (not import time) so tests and
     multi-environment setups can repoint CHRONOS_DB_PATH dynamically."""
     return os.environ.get("CHRONOS_DB_PATH", _DEFAULT_DB_PATH)
+
+
+def db_key():
+    """Passphrase from CHRONOS_DB_KEY, or None (plaintext mode)."""
+    return os.environ.get("CHRONOS_DB_KEY") or None
+
+
+def _driver():
+    """stdlib sqlite3 in plaintext mode; sqlcipher3 when a key is set."""
+    if db_key() is None:
+        return sqlite3
+    try:
+        import sqlcipher3
+        return sqlcipher3
+    except ImportError as exc:
+        raise RuntimeError(_ENCRYPTION_HINT) from exc
+
+
+# (path, passphrase) -> PRAGMA key value, either ("raw", "x'<key><salt>'")
+# or ("pass", passphrase). SQLCipher's PBKDF2 costs ~300ms per connection;
+# Chronos opens a connection per operation, so we pay the KDF once here,
+# derive the same 32-byte key locally from the salt stored in the file
+# header, and reuse SQLCipher's raw key+salt form (~1ms) ever after.
+_key_cache: dict = {}
+
+
+def _pragma_quote(passphrase: str) -> str:
+    return passphrase.replace("'", "''")
+
+
+def _resolve_key(path: str, passphrase: str, drv):
+    """Return the cached PRAGMA key value for this (path, passphrase),
+    deriving and validating it on first use. Raises RuntimeError with
+    guidance when the key cannot read the database."""
+    cached = _key_cache.get((path, passphrase))
+    if cached is not None:
+        return cached
+
+    # Slow path, once: open with the passphrase and prove readability.
+    conn = drv.connect(path)
+    try:
+        conn.execute(f"PRAGMA key = '{_pragma_quote(passphrase)}'")
+        try:
+            # Also initialises the header (and salt) on a brand-new file.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        except drv.DatabaseError as exc:
+            raise RuntimeError(_KEY_MISMATCH_HINT) from exc
+        kdf_iter = int(conn.execute("PRAGMA kdf_iter").fetchone()[0])
+    finally:
+        conn.close()
+
+    # Derive the raw key from the header salt; verify before trusting.
+    entry = ("pass", passphrase)  # safe fallback: KDF per connection
+    try:
+        with open(path, "rb") as fh:
+            salt = fh.read(16)
+        key = hashlib.pbkdf2_hmac(
+            "sha512", passphrase.encode("utf-8"), salt, kdf_iter, dklen=32
+        )
+        raw = f"x'{key.hex()}{salt.hex()}'"
+        probe = drv.connect(path)
+        try:
+            probe.execute(f'PRAGMA key = "{raw}"')
+            probe.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            entry = ("raw", raw)
+        finally:
+            probe.close()
+    except (OSError, drv.DatabaseError):
+        pass  # nonstandard cipher settings — keep the passphrase fallback
+
+    _key_cache[(path, passphrase)] = entry
+    return entry
+
+
+def _connect():
+    """Open a connection with the right driver and key. Returns (conn, drv)."""
+    drv = _driver()
+    conn = drv.connect(db_path())
+    passphrase = db_key()
+    if passphrase is not None:
+        mode, value = _resolve_key(db_path(), passphrase, drv)
+        if mode == "raw":
+            conn.execute(f'PRAGMA key = "{value}"')
+        else:
+            conn.execute(f"PRAGMA key = '{_pragma_quote(value)}'")
+    return conn, drv
 
 
 # ---------------------------------------------------------------------------
@@ -189,10 +291,16 @@ def init_db() -> None:
     Applies column migrations, creates the FTS5 index + triggers, and
     backfills the index for databases created before v4.0.
     """
-    conn = sqlite3.connect(db_path())
+    conn, drv = _connect()
     try:
-        # WAL mode for concurrent read/write safety.
-        conn.execute("PRAGMA journal_mode=WAL")
+        # WAL mode for concurrent read/write safety. Also the readability
+        # probe: an encrypted database opened without its key (or a
+        # plaintext one opened WITH a key) fails right here — fail loud
+        # with guidance instead of erroring on the first tool call.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except drv.DatabaseError as exc:
+            raise RuntimeError(_KEY_MISMATCH_HINT) from exc
         for stmt in _DDL_STATEMENTS:
             conn.execute(stmt)
         for table, column, type_default in _COLUMN_MIGRATIONS:
@@ -205,7 +313,7 @@ def init_db() -> None:
         try:
             for stmt in _FTS_DDL_STATEMENTS:
                 conn.execute(stmt)
-        except sqlite3.OperationalError as exc:
+        except drv.OperationalError as exc:
             raise RuntimeError(
                 "This Python's SQLite build does not support FTS5, which "
                 "Chronos v4 requires for search. Use a standard python.org "
@@ -226,11 +334,13 @@ def init_db() -> None:
 @contextmanager
 def get_db():
     """
-    Yield an open SQLite connection with Row factory set.
+    Yield an open SQLite connection with Row factory set (encrypted via
+    SQLCipher when CHRONOS_DB_KEY is set — see _resolve_key for why this
+    costs ~1ms, not a per-connection KDF).
     Schema is NOT initialised here — call init_db() at startup instead.
     """
-    conn = sqlite3.connect(db_path())
-    conn.row_factory = sqlite3.Row
+    conn, drv = _connect()
+    conn.row_factory = drv.Row
     try:
         yield conn
     finally:

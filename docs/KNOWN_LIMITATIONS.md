@@ -84,13 +84,26 @@ Behind `CHRONOS_ENABLE_GRAPH=1`:
 These are kept because they're useful at the margin and honest about scope —
 not because they compete with dedicated project tooling.
 
-## Plaintext at rest
+## Plaintext at rest is the default; encryption has its own edges
 
-The database is unencrypted SQLite. `purge_memory` genuinely removes content
-from every table Chronos controls, but cannot scrub OS-level artifacts (WAL
-segments already checkpointed, filesystem snapshots, backups you've made).
-Full at-rest encryption (SQLCipher or application-level) is possible but not
-implemented; it would complicate the zero-dependency story.
+Without `CHRONOS_DB_KEY`, the database is unencrypted SQLite. `purge_memory`
+genuinely removes content from every table Chronos controls, but cannot scrub
+OS-level artifacts (WAL segments already checkpointed, filesystem snapshots,
+backups you've made).
+
+With the `[encryption]` extra (v4.2, SQLCipher), the whole file is encrypted —
+but be clear-eyed about the residual exposure:
+
+- The passphrase lives in an environment variable, readable by any process
+  running as your user. OS keychains are out of scope for now.
+- Memory contents are decrypted in process RAM while the server runs.
+- `scripts/encrypt_db.py` keeps a plaintext `.bak` until you delete it, and
+  artifacts from the plaintext era (old backups, checkpointed WAL remnants)
+  remain unencrypted wherever they were.
+- Key loss is data loss. There is no recovery path, by design.
+- The derived raw key is cached in process memory to avoid SQLCipher's
+  ~300ms-per-connection PBKDF2 (measured); a debugger attached to the
+  process can read it — same trust boundary as the data itself.
 
 ## Embedding `version` column is vestigial
 

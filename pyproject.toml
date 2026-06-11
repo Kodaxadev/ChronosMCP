@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chronosmcp"
-version = "4.1.0"
+version = "4.2.0"
 description = "Temporal memory MCP server for Claude — BM25 search, time-travel queries, and FSRS-based forgetting. Local-first, zero cloud."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,6 +26,11 @@ dev = [
 # No torch, no API keys; ~70MB model downloaded once on first use.
 semantic = [
     "fastembed>=0.4"
+]
+# At-rest encryption (CHRONOS_DB_KEY): SQLCipher. sqlcipher3-wheels ships
+# prebuilt wheels incl. Windows — sqlcipher3-binary is manylinux-only.
+encryption = [
+    "sqlcipher3-wheels>=0.5"
 ]
 
 [tool.setuptools]

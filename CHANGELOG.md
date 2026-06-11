@@ -4,6 +4,38 @@ All notable changes to ChronosMCP are documented here. Entries are ordered newes
 
 ---
 
+## v4.2.0 — 2026-06-10
+
+### At-rest encryption (opt-in)
+
+`CHRONOS_DB_KEY` + `pip install "chronosmcp[encryption]"` encrypts the entire
+database — content, version history, FTS index, and WAL — with SQLCipher
+(4.12 community). Plaintext mode is untouched: without a key the stdlib
+`sqlite3` driver is used and nothing changes.
+
+- **Driver:** `sqlcipher3-wheels` (prebuilt wheels including Windows;
+  `sqlcipher3-binary` is manylinux-only — verified empirically).
+- **Performance:** SQLCipher's PBKDF2 costs ~300ms per connection (measured
+  320ms vs 0.9ms plaintext) and Chronos connects per operation. The KDF now
+  runs once at startup: the key is re-derived locally from the header salt,
+  verified, and cached in SQLCipher's raw `x'<key><salt>'` form — measured
+  ~1ms per connection after that, with a passphrase-per-connection fallback
+  for nonstandard cipher settings.
+- **Fail-loud UX:** wrong key, plaintext-file-with-key, and
+  encrypted-file-without-key all fail at startup with specific guidance.
+- **Migration:** `scripts/encrypt_db.py` (encrypt / decrypt / rekey) with
+  row-count verification, a `.bak` of the original, and WAL checkpointing.
+  Keys come from the env or a getpass prompt — never argv.
+- **Tests:** 8 new (round-trip under encryption incl. FTS5+porter, raw-key
+  fast path, all three mismatch cases, quoted passphrases, migration
+  round-trip, rekey). CI gains a dedicated encryption job on Linux + Windows.
+- FTS5, triggers, time-travel, FSRS, and semantic search are unaffected —
+  encryption is below the page layer.
+- Residual exposure documented honestly in KNOWN_LIMITATIONS (env-var key,
+  RAM, pre-encryption artifacts, no key recovery).
+
+---
+
 ## v4.1.0 — 2026-06-10
 
 ### Hybrid semantic search (opt-in)

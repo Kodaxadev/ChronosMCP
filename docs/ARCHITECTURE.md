@@ -112,6 +112,17 @@ migrations, FTS5 table + sync triggers, `init_db()`. `db_path()` resolves
 `CHRONOS_DB_PATH` at call time so tests can repoint databases. Fails loudly at
 startup if the Python build lacks FTS5.
 
+When `CHRONOS_DB_KEY` is set, the driver switches from stdlib `sqlite3` to
+`sqlcipher3` and the whole file is SQLCipher-encrypted. Because Chronos opens
+a connection per operation and SQLCipher's PBKDF2 costs ~300ms per keying
+(measured), the passphrase is resolved once: the KDF runs at startup, the
+32-byte key is re-derived locally from the salt in the file header, verified
+against the database, and cached in process memory in SQLCipher's raw
+`x'<key><salt>'` form (~1ms per connection thereafter, with a
+passphrase-per-connection fallback if the raw probe fails). Key/file
+mismatches fail loudly at `init_db()` with migration guidance
+(`scripts/encrypt_db.py`).
+
 **`chronos/search.py`** — All retrieval: `match_query()` sanitization,
 `search_memories()` (live BM25 over the join), `rank_snapshot()` (ephemeral
 FTS5 for time-travel), `token_counter()`/`cosine_similarity()` (duplicate

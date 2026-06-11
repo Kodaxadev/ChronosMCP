@@ -20,7 +20,7 @@ from mcp.server.fastmcp import FastMCP
 
 from chronos.belief_tools import register_belief_tools
 from chronos.consolidation_tools import register_consolidation_tools
-from chronos.db import get_db
+from chronos.db import db_key, get_db
 from chronos.memory_tools import register_memory_tools
 
 
@@ -270,6 +270,8 @@ def _register_stats(mcp_inst: FastMCP, embedder: Optional[object]) -> None:
             f"Avg confidence:       {avg_conf_str}\n"
             f"Belief updates:       {n_belief_updates}\n"
             f"Search feedback:      {n_feedback}\n"
+            f"Encryption at rest:   "
+            f"{'SQLCipher (enabled)' if db_key() else 'disabled (plaintext)'}\n"
             f"{graph_line}\n"
             f"Schema version:       4.1"
         )
